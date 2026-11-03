@@ -731,7 +731,10 @@ export const TASK_PAIR_ASK_DONT_JUST_REPLY_RULE: string =
   + 'never leave the question only in your own reply. Questions for your '
   + 'partner (executor/auditor) go to them by message the same way. If the '
   + 'pair still cannot decide, escalate to Brain with options and a '
-  + 'recommendation instead of looping.';
+  + 'recommendation instead of looping. For a decision blocker, call pair_decision_record kind=request with the task/round, '
+  + 'the exact question, concrete options and recommendation; keep BLOCKED/NEEDS_INPUT or pause/dependency state accurate. '
+  + 'Brain reads the task-bound human feedback and records kind=decision with requestId before using pair_resume, pair_next_round or pair_close. '
+  + 'Human feedback is not an audit PASS and never automatically resumes a paused task.';
 
 /** Shared auditor direction used in contracts and every generated brief. */
 export const TASK_PAIR_AUDITOR_PROPOSAL_RULE: string =
@@ -906,6 +909,8 @@ export const TASK_PAIR_VERBS = [
 export type TaskPairVerb = typeof TASK_PAIR_VERBS[number];
 
 export const TASK_PAIR_STATUS_AWAITING_BRAIN_DECISION = 'awaiting_brain_decision' as const;
+/** Display-only failure status used by task reference projections. */
+export const TASK_PAIR_STATUS_FAILED = 'failed' as const;
 /** Local-storage namespace for the web task-pair status panel (layout suffix is added by the UI). */
 export const TASK_PAIR_STATUS_PANEL_STORAGE_KEY = 'imcodes.task-pair-status-panel.collapsed' as const;
 export const TASK_PAIR_STATUSES = [

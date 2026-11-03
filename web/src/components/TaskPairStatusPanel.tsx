@@ -1,3 +1,5 @@
+import { TaskPairDecisionPanel } from './TaskPairDecisionPanel.js';
+import type { SupervisionConsolePairInfo } from '@shared/supervision-task-console.js';
 import { taskPairWaitKind, readPairScheduling, TASK_PAIR_WAIT_KINDS, type TaskPairScheduling } from '@shared/task-pair-suspension.js';
 import { taskPairDisplayTitle, taskPairResolveDisplaySessionLabel } from '@shared/task-pair-display.js';
 import { isMobileLayout } from '../mobile-device.js';
@@ -131,16 +133,16 @@ function hasPairActivity(events: readonly TimelineEvent[]): boolean {
   return Boolean(snapshot?.authorityUnavailable) || (Array.isArray(snapshot?.tasks) && snapshot.tasks.length > 0);
 }
 
-export function TaskPairStatusPanel({ events, sessions, serverId, scopeSessionId }: { events: readonly TimelineEvent[]; sessions?: readonly SessionLabelEntry[]; serverId?: string | null; scopeSessionId?: string | null }) {
+export function TaskPairStatusPanel({ events, sessions, serverId, scopeSessionId, collapsedVisitKey }: { events: readonly TimelineEvent[]; sessions?: readonly SessionLabelEntry[]; serverId?: string | null; scopeSessionId?: string | null; collapsedVisitKey?: string | null }) {
   const { t } = useTranslation();
   const [isMobile, setIsMobile] = useState(isMobileLayout);
-  // A phone sub-session shows its panel CLOSED every time it is opened and keeps the user's own choice in this component's memory only
+  // A phone sub-session or split-executor visit shows its panel CLOSED every time it is opened and keeps the user's own choice in this component's memory only
   // (it lives while the view stays mounted, through resizes, and is gone when the user leaves): nothing is stored. The main chat and
-  // the desktop keep the stored server-wide flag. See task-pair-panel-state.ts.
+  // other desktop windows keep the stored server-wide flag. See task-pair-panel-state.ts.
   const phoneNow = () => isPhoneScreen({ mobile: isMobileLayout(), screenWidth: window.screen?.width, screenHeight: window.screen?.height, innerWidth: window.innerWidth });
   const [phone, setPhone] = useState(phoneNow);
-  const visitScoped = usesVisitScopedChoice({ phone, scopeSessionId });
-  const [choice, setChoice] = useState<boolean | undefined>(() => (usesVisitScopedChoice({ phone: phoneNow(), scopeSessionId }) ? undefined : readServerWideChoice({ serverId, mobile: isMobileLayout() })));
+  const visitScoped = usesVisitScopedChoice({ phone, scopeSessionId, collapsedVisitKey });
+  const [choice, setChoice] = useState<boolean | undefined>(() => (usesVisitScopedChoice({ phone: phoneNow(), scopeSessionId, collapsedVisitKey }) ? undefined : readServerWideChoice({ serverId, mobile: isMobileLayout() })));
   cleanLegacyTaskPairPanelKeysOnce();
   // The mobile panel is measured against the visible chat area; when too little
   // room is left (landscape phone, keyboard open) the collapsed strip is shown
@@ -167,7 +169,8 @@ export function TaskPairStatusPanel({ events, sessions, serverId, scopeSessionId
   }, []);
   // The choice is re-resolved only when what it belongs to changes: another server or sub-session, or the layout class. A phone
   // sub-session starts closed again for a different session; a resize within the same view never reaches this.
-  const scopeKey = `${serverId ?? ''}|${scopeSessionId ?? ''}|${isMobile ? 'm' : 'd'}|${visitScoped ? 'v' : 's'}`;
+  // A split visit survives responsive layout changes, but not another task/session/server or exit/re-entry.
+  const scopeKey = JSON.stringify([serverId, scopeSessionId, collapsedVisitKey, visitScoped ? 'visit' : isMobile ? 'mobile' : 'desktop']);
   const lastScopeKey = useRef(scopeKey);
   useEffect(() => {
     if (lastScopeKey.current === scopeKey) return;
@@ -254,7 +257,7 @@ export function TaskPairStatusPanel({ events, sessions, serverId, scopeSessionId
   if (latest.size === 0 || allRows.length === 0) return null;
   // What is shown: the user's own choice if there is one, else the default (a phone sub-session: closed); too little room on a phone
   // shows the strip without touching the choice.
-  const collapsed = resolveTaskPairPanelCollapsed({ choice, mobile: isMobile, phone, scopeSessionId }) || (isMobile && cramped);
+  const collapsed = resolveTaskPairPanelCollapsed({ choice, mobile: isMobile, phone, scopeSessionId, collapsedVisitKey }) || (isMobile && cramped);
   const toggle = () => persistCollapsed(!collapsed);
   const toggleWithKeyboard = (event: KeyboardEvent) => {
     if (event.key !== 'Enter' && event.key !== ' ') return;
@@ -325,6 +328,9 @@ export function TaskPairStatusPanel({ events, sessions, serverId, scopeSessionId
           </div>
           <strong class="task-pair-status-row-title">{queued && <em>#{Number(payload.queuePosition ?? index + 1)} </em>}{title}</strong>
           {waitKind(payload) && <small class="task-pair-status-row-meta">{(payload.scheduling as TaskPairScheduling).note}{(payload.scheduling as TaskPairScheduling).dependsOn.length > 0 && t('taskPair.waiting_for_tasks', { tasks: (payload.scheduling as TaskPairScheduling).dependsOn.map((id) => String(latest.get(id)?.payload.title ?? id)).join(', ') })}</small>}
+          <TaskPairDecisionPanel taskId={String(payload.taskId)} pair={{ ...payload,
+            status: payload.toStatus, flags: payload.flags ?? [], round: payload.round ?? 0,
+          } as SupervisionConsolePairInfo} />
           <TaskPairBrief brief={typeof payload.brief === 'string' ? payload.brief : undefined} briefRevision={typeof payload.briefRevision === 'string' ? payload.briefRevision : undefined} checklist={payload.checklist as { total: number; implemented: number; audited: number } | undefined} taskId={String(payload.taskId)} defaultOpen={String(payload.taskId) === String(scopedDefaultTaskId)} />
           {duration !== undefined && <small class="task-pair-status-row-meta"><span class="task-pair-status-row-meta-icon" aria-hidden="true">⏱</span>{Number.isFinite(row.startedAt) && <>{t('taskPair.panel_started', { time: new Date(row.startedAt).toLocaleTimeString() })} · </>}{queued ? t('taskPair.panel_queued', { duration }) : t('taskPair.panel_elapsed', { duration })}</small>}
           <div class="task-pair-status-row-roles">
@@ -369,7 +375,7 @@ export function TaskPairStatusPanel({ events, sessions, serverId, scopeSessionId
 }
 
 /** Avoid mounting responsive panel effects in ordinary chats until pair data exists. */
-export function TaskPairStatusPanelHost(props: { events: readonly TimelineEvent[]; sessions?: readonly SessionLabelEntry[]; serverId?: string | null; scopeSessionId?: string | null; mobileAnchor?: Element | null; mobileAnchorRef?: { current: Element | null } }) {
+export function TaskPairStatusPanelHost(props: { events: readonly TimelineEvent[]; sessions?: readonly SessionLabelEntry[]; serverId?: string | null; scopeSessionId?: string | null; collapsedVisitKey?: string | null; mobileAnchor?: Element | null; mobileAnchorRef?: { current: Element | null } }) {
   const initialSnapshot = (window as Window & { __imcodesTaskPairSnapshot?: { authorityUnavailable?: boolean } }).__imcodesTaskPairSnapshot;
   const [active, setActive] = useState(() => hasPairActivity(props.events));
   const [authorityUnavailable, setAuthorityUnavailable] = useState(() => Boolean(initialSnapshot?.authorityUnavailable));

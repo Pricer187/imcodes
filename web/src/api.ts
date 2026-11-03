@@ -88,7 +88,17 @@ export async function withTemporaryApiKey<T>(key: string, fn: () => Promise<T>):
 /** Clear the Bearer API key (reverts to cookie auth). */
 export function clearApiKey(): void {
   _apiKey = null;
+  refreshPromise = null;
+  _refreshRetryAt = 0;
   try { localStorage.removeItem('rcc_api_key'); } catch { /* ignore */ }
+}
+
+export function resetRefreshStateForTesting(): void {
+  refreshPromise = null;
+  _lastRefreshFailure = null;
+  _refreshRetryAt = 0;
+  _crossTabRefreshLocked = false;
+  _crossTabRefreshStartedAt = 0;
 }
 
 /** Return the currently configured Bearer API key, if any. */
@@ -440,7 +450,102 @@ export function stopProactiveRefresh(): void {
   }
 }
 
+function throwIfAborted(signal?: AbortSignal | null): void {
+  if (signal?.aborted) {
+    throw signal.reason ?? new DOMException('This operation was aborted', 'AbortError');
+  }
+}
+
+function waitForPromiseWithSignal<T>(promise: Promise<T>, signal?: AbortSignal | null): Promise<T> {
+  if (!signal) return promise;
+  if (signal.aborted) {
+    promise.catch(() => {});
+    return Promise.reject(signal.reason ?? new DOMException('This operation was aborted', 'AbortError'));
+  }
+  return new Promise<T>((resolve, reject) => {
+    let settled = false;
+    const onAbort = () => {
+      if (settled) return;
+      settled = true;
+      signal.removeEventListener('abort', onAbort);
+      promise.catch(() => {});
+      reject(signal.reason ?? new DOMException('This operation was aborted', 'AbortError'));
+    };
+    signal.addEventListener('abort', onAbort, { once: true });
+    promise.then(
+      (val) => {
+        if (settled) return;
+        settled = true;
+        signal.removeEventListener('abort', onAbort);
+        resolve(val);
+      },
+      (err) => {
+        if (settled) return;
+        settled = true;
+        signal.removeEventListener('abort', onAbort);
+        reject(err);
+      },
+    );
+  });
+}
+
+async function readResponseTextWithSignal(res: Response, signal?: AbortSignal | null): Promise<string> {
+  throwIfAborted(signal);
+  let textPromise: Promise<string>;
+  try {
+    textPromise = res.text().catch(() => '');
+  } catch {
+    textPromise = Promise.resolve('');
+  }
+  const text = await waitForPromiseWithSignal(textPromise, signal);
+  throwIfAborted(signal);
+  return text;
+}
+
+async function readResponseJsonWithSignal<T>(res: Response, signal?: AbortSignal | null): Promise<T> {
+  throwIfAborted(signal);
+  let jsonPromise: Promise<T>;
+  try {
+    jsonPromise = res.json() as Promise<T>;
+  } catch (err) {
+    throwIfAborted(signal);
+    throw err;
+  }
+  const json = await waitForPromiseWithSignal(jsonPromise, signal);
+  throwIfAborted(signal);
+  return json;
+}
+
+function sleepWithSignal(ms: number, signal?: AbortSignal | null): Promise<void> {
+  if (!signal) {
+    return new Promise((resolve) => setTimeout(resolve, ms));
+  }
+  if (signal.aborted) {
+    return Promise.reject(signal.reason ?? new DOMException('This operation was aborted', 'AbortError'));
+  }
+  return new Promise<void>((resolve, reject) => {
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    let settled = false;
+    const onAbort = () => {
+      if (settled) return;
+      settled = true;
+      if (timer !== null) clearTimeout(timer);
+      signal.removeEventListener('abort', onAbort);
+      reject(signal.reason ?? new DOMException('This operation was aborted', 'AbortError'));
+    };
+    signal.addEventListener('abort', onAbort, { once: true });
+    timer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      signal.removeEventListener('abort', onAbort);
+      resolve();
+    }, ms);
+  });
+}
+
 async function rawFetch(path: string, opts: RequestInit = {}, baseUrl = _baseUrl): Promise<Response> {
+  const signal = opts.signal;
+  throwIfAborted(signal);
   const headers = new Headers(opts.headers);
   if (!headers.has('Content-Type') && opts.body && !(opts.body instanceof FormData)) {
     headers.set('Content-Type', 'application/json');
@@ -456,11 +561,15 @@ async function rawFetch(path: string, opts: RequestInit = {}, baseUrl = _baseUrl
   }
   if (path.startsWith('/api/auth/') && !path.includes('ws-ticket')) {
     try {
-      const telemetry = await getAuthTelemetryHeaders();
+      const telemetry = await waitForPromiseWithSignal(getAuthTelemetryHeaders(), signal);
       for (const [key, value] of Object.entries(telemetry)) {
         if (!headers.has(key)) headers.set(key, value);
       }
-    } catch { /* telemetry headers are best-effort — don't block auth requests */ }
+    } catch (err) {
+      if (signal?.aborted) throw (signal.reason ?? err);
+      /* telemetry headers are best-effort — don't block auth requests */
+    }
+    throwIfAborted(signal);
   }
   if (_apiKey) {
     // Native: Bearer token auth (CSRF middleware skips Bearer auth requests)
@@ -473,10 +582,12 @@ async function rawFetch(path: string, opts: RequestInit = {}, baseUrl = _baseUrl
       if (csrf) headers.set(HEADER_CSRF, csrf);
     }
   }
+  throwIfAborted(signal);
   // Native (Bearer auth): omit credentials — no cookies needed, and 'include' would
   // require Access-Control-Allow-Credentials from the server (cross-origin from capacitor://).
   // Web (cookie auth): include credentials so HttpOnly cookies are sent.
-  return fetch(`${baseUrl}${path}`, { ...opts, headers, credentials: _apiKey ? 'omit' : 'include' });
+  const fetchPromise = fetch(`${baseUrl}${path}`, { ...opts, headers, credentials: _apiKey ? 'omit' : 'include' });
+  return waitForPromiseWithSignal(fetchPromise, signal);
 }
 
 /**
@@ -654,10 +765,15 @@ export async function apiFetch<T = unknown>(
   path: string,
   opts: RequestInit = {},
 ): Promise<T> {
+  throwIfAborted(opts.signal);
+
   const res = await rawFetch(path, opts);
 
+  throwIfAborted(opts.signal);
+
   if (res.status === 409) {
-    const body = await res.text().catch(() => '');
+    const body = await readResponseTextWithSignal(res, opts.signal);
+    throwIfAborted(opts.signal);
     if (body.includes(AUTH_IDENTITY_ERRORS.CHANGED)) {
       _onAuthExpired?.(AUTH_IDENTITY_ERRORS.CHANGED);
     }
@@ -669,31 +785,41 @@ export async function apiFetch<T = unknown>(
     // session. An endpoint-specific 401 (for example, a newly added route that
     // has not yet accepted API keys) must never erase a still-valid app login.
     if (_apiKey) {
+      throwIfAborted(opts.signal);
       console.warn(`[auth] bearer 401 on ${path} — verifying account before changing login state`);
       let verifyRes: Response;
       try {
-        verifyRes = await rawFetch('/api/auth/user/me');
-      } catch {
+        verifyRes = await rawFetch('/api/auth/user/me', { signal: opts.signal });
+      } catch (err) {
+        if (opts.signal?.aborted) throw err;
         throw new ApiError(503, 'server_unavailable');
       }
+      throwIfAborted(opts.signal);
       if (verifyRes.ok) {
-        if (path === '/api/auth/user/me') return verifyRes.json() as Promise<T>;
+        if (path === '/api/auth/user/me') {
+          return await readResponseJsonWithSignal<T>(verifyRes, opts.signal);
+        }
         const retryRes = await rawFetch(path, opts);
+        throwIfAborted(opts.signal);
         if (retryRes.status === 409) {
-          const body = await retryRes.text().catch(() => '');
+          const body = await readResponseTextWithSignal(retryRes, opts.signal);
+          throwIfAborted(opts.signal);
           if (body.includes(AUTH_IDENTITY_ERRORS.CHANGED)) {
             _onAuthExpired?.(AUTH_IDENTITY_ERRORS.CHANGED);
           }
           throw new ApiError(retryRes.status, body);
         }
         if (!retryRes.ok) {
-          throw new ApiError(retryRes.status, await retryRes.text().catch(() => ''));
+          const body = await readResponseTextWithSignal(retryRes, opts.signal);
+          throw new ApiError(retryRes.status, body);
         }
-        return retryRes.json() as Promise<T>;
+        return await readResponseJsonWithSignal<T>(retryRes, opts.signal);
       }
       if (verifyRes.status >= 500) {
-        throw new ApiError(verifyRes.status, await verifyRes.text().catch(() => 'server_unavailable'));
+        const body = await readResponseTextWithSignal(verifyRes, opts.signal).catch(() => 'server_unavailable');
+        throw new ApiError(verifyRes.status, body || 'server_unavailable');
       }
+      throwIfAborted(opts.signal);
       _onAuthExpired?.(`401 on ${path} — bearer account verification failed`);
       throw new ApiError(401, 'session_expired');
     }
@@ -702,36 +828,42 @@ export async function apiFetch<T = unknown>(
     // Try to refresh the token (with one retry on failure).
     // A single failure might be transient (e.g., CSRF mismatch after cookie rotation).
     for (let attempt = 0; attempt < 2; attempt++) {
+      throwIfAborted(opts.signal);
       if (!refreshPromise) {
         refreshPromise = doRefresh().finally(() => { refreshPromise = null; });
       }
       let ok: boolean;
       try {
-        ok = await refreshPromise;
-      } catch {
+        ok = await waitForPromiseWithSignal(refreshPromise, opts.signal);
+      } catch (err) {
+        if (opts.signal?.aborted) throw err;
         // Refresh threw (5xx or network error) — server unavailable, not session expired.
         throw new ApiError(503, 'server_unavailable');
       }
+      throwIfAborted(opts.signal);
       if (ok) {
         const retryRes = await rawFetch(path, opts);
+        throwIfAborted(opts.signal);
         if (retryRes.status === 409) {
-          const body = await retryRes.text().catch(() => '');
+          const body = await readResponseTextWithSignal(retryRes, opts.signal);
+          throwIfAborted(opts.signal);
           if (body.includes(AUTH_IDENTITY_ERRORS.CHANGED)) {
             _onAuthExpired?.(AUTH_IDENTITY_ERRORS.CHANGED);
           }
           throw new ApiError(retryRes.status, body);
         }
         if (!retryRes.ok) {
-          const body = await retryRes.text().catch(() => '');
+          const body = await readResponseTextWithSignal(retryRes, opts.signal);
           throw new ApiError(retryRes.status, body);
         }
-        return retryRes.json() as Promise<T>;
+        return await readResponseJsonWithSignal<T>(retryRes, opts.signal);
       }
       // First attempt failed — wait briefly and retry once (cookies may have been updated)
       if (attempt === 0) {
-        await new Promise((r) => setTimeout(r, 1000));
+        await sleepWithSignal(1000, opts.signal);
       }
     }
+    throwIfAborted(opts.signal);
     // 429 and other non-auth refresh failures are transient. Do not verify
     // /me and call onAuthExpired: the current session may still be valid.
     if (_lastRefreshFailure && _lastRefreshFailure.status !== 401 && _lastRefreshFailure.status !== 403) {
@@ -741,23 +873,39 @@ export async function apiFetch<T = unknown>(
     // Another tab may have refreshed successfully and our cookies are now valid.
     let verifyRes: Response;
     try {
-      verifyRes = await rawFetch('/api/auth/user/me');
-    } catch {
+      verifyRes = await rawFetch('/api/auth/user/me', { signal: opts.signal });
+    } catch (err) {
+      if (opts.signal?.aborted) throw err;
       throw new ApiError(503, 'server_unavailable');
     }
+    throwIfAborted(opts.signal);
     if (verifyRes.ok) {
       console.warn(`[auth] refresh failed but /me succeeded — session still valid, retrying original request`);
       _lastRefreshAt = Date.now();
-      if (path === '/api/auth/user/me') return verifyRes.json() as Promise<T>;
-      const retryRes = await rawFetch(path, opts);
-      if (!retryRes.ok) {
-        throw new ApiError(retryRes.status, await retryRes.text().catch(() => ''));
+      if (path === '/api/auth/user/me') {
+        return await readResponseJsonWithSignal<T>(verifyRes, opts.signal);
       }
-      return retryRes.json() as Promise<T>;
+      const retryRes = await rawFetch(path, opts);
+      throwIfAborted(opts.signal);
+      if (retryRes.status === 409) {
+        const body = await readResponseTextWithSignal(retryRes, opts.signal);
+        throwIfAborted(opts.signal);
+        if (body.includes(AUTH_IDENTITY_ERRORS.CHANGED)) {
+          _onAuthExpired?.(AUTH_IDENTITY_ERRORS.CHANGED);
+        }
+        throw new ApiError(retryRes.status, body);
+      }
+      if (!retryRes.ok) {
+        const body = await readResponseTextWithSignal(retryRes, opts.signal);
+        throw new ApiError(retryRes.status, body);
+      }
+      return await readResponseJsonWithSignal<T>(retryRes, opts.signal);
     }
     if (verifyRes.status >= 500) {
-      throw new ApiError(verifyRes.status, await verifyRes.text().catch(() => 'server_unavailable'));
+      const body = await readResponseTextWithSignal(verifyRes, opts.signal).catch(() => 'server_unavailable');
+      throw new ApiError(verifyRes.status, body || 'server_unavailable');
     }
+    throwIfAborted(opts.signal);
     console.warn(`[auth] LOGOUT: refresh failed twice + /me failed for ${path}, triggering onAuthExpired`);
     _onAuthExpired?.(`401 on ${path} — refresh failed twice`);
     throw new ApiError(401, 'session_expired');
@@ -765,22 +913,41 @@ export async function apiFetch<T = unknown>(
 
   // CSRF token mismatch (cookie expired) — refresh session to get new CSRF cookie, then retry
   if (res.status === 403) {
-    const body = await res.text().catch(() => '');
+    const body = await readResponseTextWithSignal(res, opts.signal);
+    throwIfAborted(opts.signal);
     if (body.includes('csrf_rejected')) {
       console.warn(`[auth] CSRF rejected on ${path} — refreshing session for new CSRF cookie`);
       if (!refreshPromise) {
         refreshPromise = doRefresh().finally(() => { refreshPromise = null; });
       }
       try {
-        const ok = await refreshPromise;
+        const ok = await waitForPromiseWithSignal(refreshPromise, opts.signal);
+        throwIfAborted(opts.signal);
         if (ok) {
           const retryRes = await rawFetch(path, opts);
-          if (!retryRes.ok) throw new ApiError(retryRes.status, await retryRes.text().catch(() => ''));
-          return retryRes.json() as Promise<T>;
+          throwIfAborted(opts.signal);
+          if (retryRes.status === 409) {
+            const retryBody = await readResponseTextWithSignal(retryRes, opts.signal);
+            throwIfAborted(opts.signal);
+            if (retryBody.includes(AUTH_IDENTITY_ERRORS.CHANGED)) {
+              _onAuthExpired?.(AUTH_IDENTITY_ERRORS.CHANGED);
+            }
+            throw new ApiError(retryRes.status, retryBody);
+          }
+          if (!retryRes.ok) {
+            const retryBody = await readResponseTextWithSignal(retryRes, opts.signal);
+            throw new ApiError(retryRes.status, retryBody);
+          }
+          return await readResponseJsonWithSignal<T>(retryRes, opts.signal);
         }
-      } catch { /* refresh failed */ }
+      } catch (err) {
+        if (opts.signal?.aborted) throw err;
+        /* refresh failed */
+      }
+      throwIfAborted(opts.signal);
       throw new ApiError(403, body);
     }
+    throwIfAborted(opts.signal);
     // The ACCOUNT was disabled (or is pending) while this session was open: the server refuses every credential of it with these codes.
     // That is the end of the login, not a failure of this one request.
     if (body.includes(AUTH_ERROR_CODES.ACCOUNT_DISABLED) || body.includes(AUTH_ERROR_CODES.ACCOUNT_PENDING)) {
@@ -790,11 +957,11 @@ export async function apiFetch<T = unknown>(
   }
 
   if (!res.ok) {
-    const body = await res.text().catch(() => '');
+    const body = await readResponseTextWithSignal(res, opts.signal);
     throw new ApiError(res.status, body);
   }
 
-  return res.json() as Promise<T>;
+  return await readResponseJsonWithSignal<T>(res, opts.signal);
 }
 
 export async function sendSessionViaHttp(
@@ -996,11 +1163,67 @@ export interface OpenSharedEntryResponse {
   }>;
 }
 
-export async function openSharedEntry(target: ShareTarget): Promise<OpenSharedEntryResponse> {
-  return apiFetch<OpenSharedEntryResponse>('/api/shares/open', {
-    method: 'POST',
-    body: JSON.stringify({ target }),
-  });
+export class SharedOpenTimeoutError extends Error {
+  constructor(message = 'Shared entry open timed out') {
+    super(message);
+    this.name = 'SharedOpenTimeoutError';
+  }
+}
+
+export interface OpenSharedEntryOptions {
+  signal?: AbortSignal;
+  timeoutMs?: number;
+}
+
+export const DEFAULT_SHARED_ENTRY_OPEN_TIMEOUT_MS = 15_000;
+
+export async function openSharedEntry(
+  target: ShareTarget,
+  opts?: OpenSharedEntryOptions,
+): Promise<OpenSharedEntryResponse> {
+  const timeoutMs = opts?.timeoutMs ?? DEFAULT_SHARED_ENTRY_OPEN_TIMEOUT_MS;
+  const controller = new AbortController();
+  let timedOut = false;
+  let timer: ReturnType<typeof setTimeout> | null = null;
+
+  if (timeoutMs > 0 && Number.isFinite(timeoutMs)) {
+    timer = setTimeout(() => {
+      timedOut = true;
+      controller.abort(new SharedOpenTimeoutError());
+    }, timeoutMs);
+  }
+
+  const parentSignal = opts?.signal;
+  let onParentAbort: (() => void) | null = null;
+  if (parentSignal) {
+    if (parentSignal.aborted) {
+      if (timer !== null) clearTimeout(timer);
+      controller.abort(parentSignal.reason);
+      throw parentSignal.reason ?? new DOMException('This operation was aborted', 'AbortError');
+    }
+    onParentAbort = () => {
+      controller.abort(parentSignal.reason);
+    };
+    parentSignal.addEventListener('abort', onParentAbort, { once: true });
+  }
+
+  try {
+    return await apiFetch<OpenSharedEntryResponse>('/api/shares/open', {
+      method: 'POST',
+      body: JSON.stringify({ target }),
+      signal: controller.signal,
+    });
+  } catch (err) {
+    if (timedOut || err instanceof SharedOpenTimeoutError) {
+      throw new SharedOpenTimeoutError();
+    }
+    throw err;
+  } finally {
+    if (timer !== null) clearTimeout(timer);
+    if (parentSignal && onParentAbort) {
+      parentSignal.removeEventListener('abort', onParentAbort);
+    }
+  }
 }
 
 function isRetryableNonceExchangeError(error: unknown): boolean {

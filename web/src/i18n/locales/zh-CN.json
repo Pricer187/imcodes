@@ -202,6 +202,8 @@
       "count": "{{count}} 项共享",
       "guideReturn": "返回 {{server}}",
       "guideDismiss": "知道了",
+      "openTimeout": "打开共享访问超时，请重试。",
+      "openFailed": "打开共享访问失败，请重试。",
       "kind": {
         "server": "服务器",
         "tab": "标签",
@@ -4669,6 +4671,7 @@
       "passed": "审核通过",
       "done": "已完成",
       "cancelled": "已取消",
+      "failed": "已失败",
       "rework_round": "返工第{{round}}轮",
       "awaiting_brain_decision": "等待 Brain 决定",
       "paused": "已暂停",
@@ -4769,6 +4772,33 @@
     "card_next_step": "Next step",
     "card_details_unavailable": "Detailed information was not provided; see the original notice below.",
     "card_no_blocking": "No blocking findings.",
-    "waiting_for_tasks": "等待任务：{{tasks}}"
+    "waiting_for_tasks": "等待任务：{{tasks}}",
+    "decision": {
+      "ask": "请 Brain 说明卡点",
+      "ask_message": "请说明本任务具体卡点、可选方案和建议，记录为待决策问题。",
+      "ready": "条件已具备，请核查",
+      "ready_message": "条件已具备，请 Brain 核查并裁决是否恢复；不要绕过依赖或审计。",
+      "wait": "继续等待",
+      "wait_message": "继续等待，保留现有暂停和依赖条件。",
+      "title": "待决策 / 卡点",
+      "missing": "卡点尚未说明，可在此补充反馈或请 Brain 给出问题与选项。",
+      "recommendation": "建议",
+      "feedback": "补充反馈",
+      "placeholder": "输入条件、选择理由或需要 Brain 裁决的事项…",
+      "send": "发送给 Brain",
+      "sending": "保存中…",
+      "sent": "已保存反馈并排队通知 Brain；等待裁决，任务不会自动恢复。",
+      "failed": "反馈失败，可重试",
+      "history": "决策记录",
+      "ruling": "Brain 裁决",
+      "resolved": "已裁决",
+      "time": "裁决时间",
+      "upgrade": "请升级或重连 daemon 后再提交反馈。",
+      "kind": {
+        "request": "待决策问题",
+        "feedback": "人工反馈",
+        "decision": "Brain 裁决"
+      }
+    }
   }
 }

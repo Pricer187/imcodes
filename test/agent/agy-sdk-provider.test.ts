@@ -40,7 +40,10 @@ const resumeIdx = args.indexOf('--conversation');
 if (process.env.FAKE_AGY_IDENTITY_FILE) fs.appendFileSync(process.env.FAKE_AGY_IDENTITY_FILE, JSON.stringify({ resumeId: resumeIdx >= 0 ? args[resumeIdx + 1] : null, ...Object.fromEntries(${JSON.stringify([IMCODES_SESSION_ENV,E.SESSION_NAME,E.SESSION_INSTANCE_ID,E.RUNTIME_EPOCH,E.PROVIDER_ID])}.map(k => [k, process.env[k]])) }) + '\\n');
 const convId = resumeIdx >= 0 ? args[resumeIdx + 1] : 'conv-' + process.pid;
 const emit = (o) => process.stdout.write(JSON.stringify(o) + '\\n');
-emit({ event: 'init', conversation_id: convId, init: { cwd: process.cwd(), tools: [], permission_mode: 'always-proceed' } });
+const init=()=>emit({ event: 'init', conversation_id: convId, init: { cwd: process.cwd(), tools: [], permission_mode: 'always-proceed' } });
+if(process.env.FAKE_AGY_INIT_GATE) {
+ const gate=setInterval(()=>{if(fs.existsSync(process.env.FAKE_AGY_INIT_GATE)){clearInterval(gate);init();}},5);
+} else init();
 let step = 0;
 let buf = '';
 process.stdin.on('data', (d) => {
@@ -58,25 +61,28 @@ process.stdin.on('data', (d) => {
       setTimeout(() => process.exit(1), 100);
       return;
     }
+    if (text.includes('HANG')) return;
+    const scenario = text.replace(/^API_/, 'QUOTA_');
     if (text.includes('NATIVE_LOST')) {
       const fixture = require(process.env.FAKE_AGY_NATIVE_FIXTURE);
-      fixture.persist(process.env.HOME, text, { currentError: text.includes('NATIVE_LOST_REAL_ERROR'), answer: text });
-      emit({ event:'result', result:{ conversation_id:convId, status:'ERROR', response:'', error:fixture.ERROR } });
+      const error = text.includes('NATIVE_LOST_API') ? fixture.API_ERROR : fixture.ERROR;
+      fixture.persist(process.env.HOME, text, { currentError: text.includes('REAL_ERROR'), answer: text, error, ...(text.includes('NATIVE_LOST_API') ? { historicalStatus: 3 } : {}) });
+      emit({ event:'result', result:{ conversation_id:convId, status:'ERROR', response:'', error } });
       continue;
     }
-    if (text.includes('QUOTA_OLD_RESPONSE')) {
+    if (scenario.includes('QUOTA_OLD_RESPONSE')) {
       emit({ event: 'step_update', step_update: { conversation_id: convId, step_index: step++, state: 'DONE', step_type: 'agent_response', text_delta: 'Hello\\n' } });
     }
-    if (!text.includes('QUOTA_NO_BOUNDARY')) {
+    if (!scenario.includes('QUOTA_NO_BOUNDARY')) {
       emit({ event: 'step_update', step_update: { conversation_id: convId, step_index: step++, state: 'DONE', step_type: 'user_input' } });
     }
-    if (text.includes('QUOTA_')) {
-      const quota = 'Individual quota reached. Please upgrade your subscription to increase your limits. Resets in 50m15s.';
-      const hasResponse = !text.includes('QUOTA_EMPTY') && !text.includes('QUOTA_OLD_RESPONSE');
-      if (text.includes('QUOTA_MULTISTEP')) {
+    if (scenario.includes('QUOTA_')) {
+      const quota = text.startsWith('API_') ? 'API error (attempt 1): request failed: Post https://daily-cloudcode-pa.googleapis.com/v1internal:streamGenerateContent?alt=sse: EOF' : 'Individual quota reached. Please upgrade your subscription to increase your limits. Resets in 50m15s.';
+      const hasResponse = !scenario.includes('QUOTA_EMPTY') && !scenario.includes('QUOTA_OLD_RESPONSE');
+      if (scenario.includes('QUOTA_MULTISTEP')) {
         emit({ event: 'step_update', step_update: { conversation_id: convId, step_index: step++, state: 'DONE', step_type: 'agent_response', text_delta: 'Before\\n' } });
       }
-      if (text.includes('QUOTA_COMPLETED_TOOL') || text.includes('QUOTA_MULTISTEP')) {
+      if (scenario.includes('QUOTA_COMPLETED_TOOL') || scenario.includes('QUOTA_MULTISTEP')) {
         const toolIdx = step++;
         emit({ event: 'step_update', step_update: { conversation_id: convId, step_index: toolIdx, state: 'ACTIVE', step_type: 'tool', tool_name: 'run_command', tool_info: { name: 'run_command', parameters: {} } } });
         emit({ event: 'step_update', step_update: { conversation_id: convId, step_index: toolIdx, state: 'DONE', step_type: 'tool', tool_name: 'run_command', tool_info: { name: 'run_command', parameters: {}, output: 'ok' } } });
@@ -84,20 +90,19 @@ process.stdin.on('data', (d) => {
 
       const idx = step++;
       if (hasResponse) {
-        const stepIndex = text.includes('QUOTA_NO_INDEX') ? undefined : idx;
+        const stepIndex = scenario.includes('QUOTA_NO_INDEX') ? undefined : idx;
         emit({ event: 'step_update', step_update: { conversation_id: convId, step_index: stepIndex, state: 'ACTIVE', step_type: 'agent_response', text_delta: 'Hello' } });
-        if (!text.includes('QUOTA_PARTIAL')) {
-          emit({ event: 'step_update', step_update: { conversation_id: convId, step_index: stepIndex, state: 'DONE', step_type: 'agent_response', text_delta: '\\n', ...(text.includes('QUOTA_DETAILS') ? { error_details: { message: quota } } : {}) } });
+        if (!scenario.includes('QUOTA_PARTIAL')) {
+          emit({ event: 'step_update', step_update: { conversation_id: convId, step_index: stepIndex, state: 'DONE', step_type: 'agent_response', text_delta: '\\n', ...(scenario.includes('QUOTA_DETAILS') ? { error_details: { message: quota } } : {}) } });
         }
       }
-      if (text.includes('QUOTA_TOOL')) emit({ event: 'step_update', step_update: { conversation_id: convId, step_index: step++, state: 'ACTIVE', step_type: 'tool', tool_name: 'run_command', tool_info: { name: 'run_command', parameters: {} } } });
-      if (text.includes('QUOTA_CURRENT_ERROR')) emit({ event: 'step_update', step_update: { conversation_id: convId, step_index: text.includes('NO_INDEX_ERROR') ? undefined : step++, state: 'DONE', step_type: 'system_error', text_delta: quota } });
-      if (text.includes('QUOTA_ACTIVE_AFTER_DONE')) emit({ event: 'step_update', step_update: { conversation_id: convId, step_index: idx, state: 'ACTIVE', step_type: 'agent_response', text_delta: ' more' } });
-      emit({ event: 'result', result: { conversation_id: convId, status: 'ERROR', response: text.includes('QUOTA_MISMATCH') ? 'Other response' : text.includes('QUOTA_MULTISTEP') ? 'Before\\nHello\\n' : hasResponse ? 'Hello\\n' : '', error: text.includes('QUOTA_NEW_FAILURE') ? 'boom unauthorized' : quota, num_turns: 1, usage: {} } });
-      if (text.includes('QUOTA_EMPTY_EXIT')) process.exit(0);
+      if (scenario.includes('QUOTA_TOOL')) emit({ event: 'step_update', step_update: { conversation_id: convId, step_index: step++, state: 'ACTIVE', step_type: 'tool', tool_name: 'run_command', tool_info: { name: 'run_command', parameters: {} } } });
+      if (scenario.includes('QUOTA_CURRENT_ERROR')) emit({ event: 'step_update', step_update: { conversation_id: convId, step_index: scenario.includes('NO_INDEX_ERROR') ? undefined : step++, state: 'DONE', step_type: 'system_error', text_delta: quota } });
+      if (scenario.includes('QUOTA_ACTIVE_AFTER_DONE')) emit({ event: 'step_update', step_update: { conversation_id: convId, step_index: idx, state: 'ACTIVE', step_type: 'agent_response', text_delta: ' more' } });
+      emit({ event: 'result', result: { conversation_id: convId, status: 'ERROR', response: scenario.includes('QUOTA_MISMATCH') ? 'Other response' : scenario.includes('QUOTA_MULTISTEP') ? 'Before\\nHello\\n' : hasResponse ? 'Hello\\n' : '', error: scenario.includes('QUOTA_NEW_FAILURE') ? 'boom unauthorized' : quota, num_turns: 1, usage: {} } });
+      if (scenario.includes('QUOTA_EMPTY_EXIT')) process.exit(0);
       continue;
     }
-    if (text.includes('HANG')) return;
     if (text.includes('FAIL')) {
       emit({ event: 'result', result: { conversation_id: convId, status: 'ERROR', response: '', error: 'boom unauthorized', num_turns: 0, usage: {} } });
       continue;
@@ -217,6 +222,10 @@ describe('AgySdkProvider (fake agy process)', () => {
 
   beforeEach(async () => {
     dir = mkdtempSync(path.join(tmpdir(), 'imcodes-agy-test-'));
+    // The managed MCP env inherits the process home. Isolate it too, rather
+    // than letting different fake conversations reuse the suite's shared DB.
+    vi.stubEnv('HOME', dir);
+    vi.stubEnv('USERPROFILE', dir);
     const bin = path.join(dir, 'agy');
     writeFileSync(bin, FAKE_AGY);
     chmodSync(bin, 0o755);
@@ -238,6 +247,7 @@ describe('AgySdkProvider (fake agy process)', () => {
   afterEach(async () => {
     vi.restoreAllMocks();
     await provider.disconnect();
+    vi.unstubAllEnvs();
     rmSync(dir, { recursive: true, force: true });
   });
 
@@ -329,6 +339,66 @@ describe('AgySdkProvider (fake agy process)', () => {
     expect(inputs()[5]).toContain(contractV2);
   });
 
+  it('never spawns before the start barrier commits, and a failed barrier cannot start a child', async () => {
+    let resolve!: () => void;
+    const barrier = vi.fn(() => new Promise<void>(r => { resolve = r; }));
+    const sid = await provider.createSession({ sessionKey: 'barrier', cwd: dir, beforeNativeSessionStart: barrier });
+    const send = provider.send(sid, 'hello');
+    await waitFor(() => barrier.mock.calls.length === 1);
+    expect(launches()).toEqual([]);
+    resolve(); await send; await waitFor(() => completes.length === 1);
+    expect(launches()).toHaveLength(1);
+    const failed = await provider.createSession({ sessionKey: 'failed-barrier', cwd: dir,
+      beforeNativeSessionStart: async () => { throw new Error('disk full'); } });
+    await expect(provider.send(failed, 'hello')).rejects.toThrow('disk full');
+    expect(launches()).toHaveLength(1);
+  });
+
+  it('shares a pending start commit across concurrent inputs without duplicate children', async () => {
+    let resolve!: () => void;
+    const barrier = vi.fn(() => new Promise<void>(r => { resolve = r; }));
+    const sid = await provider.createSession({ sessionKey: 'concurrent-start', cwd: dir, beforeNativeSessionStart: barrier });
+    const first = provider.send(sid, 'first'); const second = provider.send(sid, 'second');
+    await waitFor(() => barrier.mock.calls.length > 0);
+    expect(barrier).toHaveBeenCalledTimes(1); expect(launches()).toEqual([]);
+    resolve(); await Promise.all([first, second]); await waitFor(() => completes.length === 2);
+    expect(launches()).toHaveLength(1); expect(inputs()).toEqual(['first','second']);
+  });
+
+  it.each(['stop', 'stopAndWait', 'end', 'rebind', 'disconnect'])('does not spawn after %s supersedes a pending start commit', async action => {
+    let resolve!: () => void;
+    let entered = false;
+    const sid = await provider.createSession({ sessionKey: 'pending-start', cwd: dir,
+      beforeNativeSessionStart: () => new Promise<void>(r => { entered = true; resolve = r; }) });
+    const send = provider.send(sid, 'hello');
+    const rejected = expect(send).rejects.toMatchObject({ code: PROVIDER_ERROR_CODES.CANCELLED });
+    await waitFor(() => entered);
+    if (action === 'stop') await provider.cancel(sid);
+    else if (action === 'stopAndWait') await provider.cancelAndWait(sid);
+    else if (action === 'end') await provider.endSession(sid);
+    else if (action === 'rebind') await provider.createSession({ sessionKey: sid, cwd: dir, fresh: true });
+    else await provider.disconnect();
+    resolve(); await rejected;
+    expect(launches()).toEqual([]);
+    expect(inputs()).toEqual([]);
+  });
+
+  it.each(['stop','end','rebind','disconnect'])('does not publish a pending native init after %s',async action=>{
+    // Hold every native ID until cancellation: HANG must not emit a
+    // conversation-bearing user_input before this deliberately pending init.
+    const gate=path.join(dir,'release-init');
+    const sid=await provider.createSession({sessionKey:'delayed-init',cwd:dir,env:{FAKE_AGY_INIT_GATE:gate}});
+    await provider.send(sid,'HANG');await waitFor(()=>launches().length===1);
+    expect(infos).toEqual([]);
+    if(action==='stop')await provider.cancelAndWait(sid);
+    else if(action==='end')await provider.endSession(sid);
+    else if(action==='rebind')await provider.createSession({sessionKey:sid,cwd:dir,fresh:true});
+    else await provider.disconnect();
+    writeFileSync(gate,'release');
+    await new Promise(r=>setImmediate(r));
+    expect(infos).toEqual([]);expect(completes).toEqual([]);
+  });
+
   it('streams deltas, completes the turn and reports the conversation id for resume', async () => {
     const sid = await provider.createSession({ sessionKey: 's1', cwd: dir });
     await provider.send(sid, 'say hello');
@@ -376,6 +446,7 @@ describe('AgySdkProvider (fake agy process)', () => {
     const conversation = '11111111-1111-4111-8111-111111111111';
     let sid = await provider.createSession({sessionKey:key,cwd:dir,resumeId:conversation});
     await provider.send(sid,'NATIVE_LOST first');
+    await waitFor(() => completes.length + errors.length === 1);
     await provider.send(sid,'NATIVE_LOST second');
     await waitFor(() => completes.length+errors.length===2);
     expect(errors).toHaveLength(0);
@@ -389,6 +460,65 @@ describe('AgySdkProvider (fake agy process)', () => {
     expect(completes[2][1].content).toBe('NATIVE_LOST third');
     expect(launches()).toHaveLength(2); // only the EXPLICIT session end started a new CLI
     expect(provider.getSessionDiagnostics(sid)).toMatchObject({inflightTurns:0});
+  });
+
+  it('completes repeated turns carrying a historical API EOF without replaying or restarting', async () => {
+    const sid = await provider.createSession({ sessionKey: 'api-history', cwd: dir, resumeId: 'existing-conversation' });
+    await provider.send(sid, 'API_STALE');
+    await provider.send(sid, 'API_COMPLETED_TOOL');
+    await waitFor(() => completes.length + errors.length === 2);
+    expect(errors).toHaveLength(0);
+    expect(completes.map(([, m]) => m.content)).toEqual(['Hello', 'Hello']);
+    expect(launches()).toHaveLength(1);
+    expect(inputs()).toHaveLength(2);
+    expect(provider.getSessionDiagnostics(sid)).toMatchObject({ inflightTurns: 0 });
+  });
+
+  it('requires an observed failure before treating an API error in a fresh conversation as historical', async () => {
+    const sid = await provider.createSession({ sessionKey: 'api-fresh', cwd: dir, fresh: true });
+    await provider.send(sid, 'API_STALE');
+    await waitFor(() => errors.length === 1);
+    expect(completes).toHaveLength(0);
+    await provider.send(sid, 'API_STALE');
+    await waitFor(() => completes.length + errors.length === 2);
+    expect(errors).toHaveLength(1);
+    expect(completes[0][1].content).toBe('Hello');
+    expect(launches()).toHaveLength(1);
+  });
+
+  it('recovers DB-only API answers with DONE system_error history, while preserving a new current error', async () => {
+    await provider.disconnect();
+    await provider.connect({ binaryPath:path.join(dir,'agy'), env:{ HOME:dir, FAKE_AGY_ARGS_FILE:argsFile,
+      FAKE_AGY_NATIVE_FIXTURE:path.resolve('test/fixtures/agy-native-history/fixture.cjs') } });
+    const sid = await provider.createSession({ sessionKey:'api-native', cwd:dir, resumeId:'11111111-1111-4111-8111-111111111111' });
+    // These cases require a stable native snapshot. Preparing the next fake
+    // SQLite turn concurrently may correctly make the fail-closed reader
+    // decline recovery; queued-turn binding is covered by the history suite.
+    await provider.send(sid, 'NATIVE_LOST_API first');
+    await waitFor(() => completes.length + errors.length === 1);
+    expect(errors).toHaveLength(0);
+    await provider.send(sid, 'NATIVE_LOST_API second');
+    await waitFor(() => completes.length + errors.length === 2);
+    expect(errors).toHaveLength(0);
+    await provider.send(sid, 'NATIVE_LOST_API_REAL_ERROR');
+    await waitFor(() => completes.length + errors.length === 3);
+    expect(completes.map(([,m]) => m.content)).toEqual(['NATIVE_LOST_API first', 'NATIVE_LOST_API second']);
+    expect(errors).toHaveLength(1);
+    expect(errors[0][1].message).toContain('API error (attempt 1)');
+    expect(launches()).toHaveLength(1);
+  });
+
+  it.each([
+    'API_EMPTY', 'API_PARTIAL', 'API_TOOL', 'API_CURRENT_ERROR', 'API_DETAILS',
+    'API_MISMATCH', 'API_ACTIVE_AFTER_DONE', 'API_NO_BOUNDARY', 'API_NO_INDEX',
+    'API_OLD_RESPONSE', 'API_NEW_FAILURE', 'API_CURRENT_ERROR_NO_INDEX_ERROR',
+  ])('does not conceal a real or unproven API failure: %s', async (prompt) => {
+    const sid = await provider.createSession({ sessionKey:prompt, cwd:dir, resumeId:'existing-conversation' });
+    await provider.send(sid, prompt);
+    await waitFor(() => completes.length + errors.length === 1);
+    expect(completes).toHaveLength(0);
+    expect(errors).toHaveLength(1);
+    expect(errors[0][1].message).toContain(prompt === 'API_NEW_FAILURE' ? 'unauthorized' : 'API error (attempt 1)');
   });
 
   it('keeps genuine current native quota failures even when a completed answer precedes them', async () => {

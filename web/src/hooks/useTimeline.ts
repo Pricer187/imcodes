@@ -231,7 +231,7 @@ const BACKGROUND_BACKFILL_FAILURE_BACKOFF_BASE_MS = 5_000;
 const BACKGROUND_BACKFILL_FAILURE_BACKOFF_MAX_MS = 60_000;
 const backgroundBackfillGateByCacheKey = new Map<string, { inFlight: number; failureStreak: number; nextAllowedAt: number }>();
 /** Sessions whose stale-window hole is being filled right now (any window): one filler per session. */
-const gapBackfillInFlight = new Set<string>();
+const gapBackfillInFlight = new Map<string, symbol>();
 /**
  * A hole page the daemon keeps trimming to its payload budget is refetched (the dropped events lie inside its
  * range), at most this many times at the same stitched top; after that the filler descends past it so one
@@ -2059,9 +2059,14 @@ function getTimelineNoticeKey(msg: TimelinePayloadMetadata, state: TimelineHisto
 function getTimelineResponseState(
   msg: TimelineProtocolServerMessage,
 ): TimelineHistoryResponseState {
+  if (
+    msg.status === TIMELINE_RESPONSE_STATUS.CANCELED
+    || msg.errorReason === TIMELINE_HISTORY_ERROR_REASONS.REQUEST_CANCELED
+  ) {
+    return 'canceled';
+  }
   if (msg.status === TIMELINE_RESPONSE_STATUS.ERROR || msg.errorReason) return 'error';
   if (msg.status === TIMELINE_RESPONSE_STATUS.DEFERRED) return 'deferred';
-  if (msg.status === TIMELINE_RESPONSE_STATUS.CANCELED) return 'canceled';
   if (msg.status === TIMELINE_RESPONSE_STATUS.PARTIAL || msg.payloadTruncated) return 'partial';
   if (msg.type === TIMELINE_MESSAGES.DETAIL) return 'detail';
   return getTimelineEvents(msg).length === 0 ? 'empty' : 'ok';
@@ -2473,6 +2478,8 @@ export function useTimeline(
   ));
   const loadingOlderRef = useRef(false); // Synchronous guard against duplicate pagination requests
   const httpBackfillInFlightRef = useRef<Record<HttpBackfillMode, number>>(createHttpBackfillCountState());
+  const scopeGenerationRef = useRef<number>(0);
+  const errorSequenceRef = useRef<number>(0);
   const httpBackfillTimerRef = useRef<Record<HttpBackfillMode, ReturnType<typeof setTimeout> | null>>(createHttpBackfillTimerState());
   const httpBackfillTimerDueAtRef = useRef<Record<HttpBackfillMode, number>>(createHttpBackfillDueAtState());
   const epochRef = useRef<number>(0);
@@ -2551,6 +2558,9 @@ export function useTimeline(
     phase?: Exclude<TimelineHistoryPhase, 'idle'>,
   ) => {
     const response = createTimelineHistoryResponseNotice(msg);
+    if (response?.state === 'error') {
+      errorSequenceRef.current += 1;
+    }
     setHistoryStatus((prev) => ({
       ...prev,
       phase: phase ?? prev.phase,
@@ -2791,6 +2801,7 @@ export function useTimeline(
     // history branch).
     newerCursorKeyRef.current = null;
     if (!sessionId) {
+      scopeGenerationRef.current += 1;
       setLoading(false);
       setHttpRefreshing(false);
       setHistoryStatus(createIdleHistoryStatus());
@@ -2804,6 +2815,7 @@ export function useTimeline(
       return;
     }
     if (disableHistory) {
+      scopeGenerationRef.current += 1;
       setEvents([]);
       setLoading(false);
       setRefreshing(false);
@@ -2821,6 +2833,7 @@ export function useTimeline(
       return;
     }
 
+    scopeGenerationRef.current += 1;
     setRefreshing(false);
     setHttpRefreshing(false);
     // A new cacheKey means a new local store to account for, so the ledger must
@@ -4359,6 +4372,9 @@ export function useTimeline(
     const foregroundRound = visible && roundsChained === 0 && resumeBeforeTs === undefined;
     const backfillSessionId = sessionId;
     const backfillCacheKey = cacheKey;
+    const roundGeneration = scopeGenerationRef.current;
+    const roundStartedErrorSeq = errorSequenceRef.current;
+    const inFlightCounts = httpBackfillInFlightRef.current;
     const dueAt = Date.now() + Math.max(0, delayMs);
     if (mode === 'manualLatestWindow') clearHttpBackfillTimer('tail');
     if (httpBackfillTimerRef.current[mode] && httpBackfillTimerDueAtRef.current[mode] <= dueAt) {
@@ -4366,18 +4382,18 @@ export function useTimeline(
         sessionId: backfillSessionId,
         mode,
         hasTimer: true,
-        inFlight: httpBackfillInFlightRef.current[mode],
+        inFlight: inFlightCounts[mode],
       });
       if (foregroundRound) updateHistoryStep('http', 'running', phase);
       return;
     }
     if (httpBackfillTimerRef.current[mode]) clearHttpBackfillTimer(mode);
-    if (httpBackfillInFlightRef.current[mode] > 0) {
+    if (inFlightCounts[mode] > 0) {
       backfillDebug('fireHttpBackfill: coalesced', {
         sessionId: backfillSessionId,
         mode,
         hasTimer: false,
-        inFlight: httpBackfillInFlightRef.current[mode],
+        inFlight: inFlightCounts[mode],
       });
       if (foregroundRound) updateHistoryStep('http', 'running', phase);
       return;
@@ -4386,7 +4402,7 @@ export function useTimeline(
     httpBackfillTimerRef.current[mode] = setTimeout(() => {
       httpBackfillTimerRef.current[mode] = null;
       httpBackfillTimerDueAtRef.current[mode] = 0;
-      if (cacheKeyRef.current !== backfillCacheKey) return;
+      if (scopeGenerationRef.current !== roundGeneration || cacheKeyRef.current !== backfillCacheKey) return;
       // A recorded hole is unfinished work, whatever the last successful catch-up says.
       if (backfillCacheKey && cooldownMs > 0 && !getTimelineGap(backfillCacheKey)) {
         const lastOk = lastHttpBackfillResponseAt.get(backfillCacheKey);
@@ -4424,7 +4440,11 @@ export function useTimeline(
         return;
       }
       let holdsGapFiller = isGapFiller;
-      if (isGapFiller) gapBackfillInFlight.add(backfillCacheKey!);
+      let heldFillerToken: symbol | null = null;
+      if (isGapFiller && backfillCacheKey) {
+        heldFillerToken = Symbol('gapFiller');
+        gapBackfillInFlight.set(backfillCacheKey, heldFillerToken);
+      }
       if (gate) gate.inFlight += 1;
       // The lower bound of a catch-up is normally the newest ts the cache holds. While a hole is recorded
       // (or the reopen has not yet decided whether there is one) that would be wrong: the merged tail has
@@ -4455,7 +4475,7 @@ export function useTimeline(
       const maxPages = foregroundRound || mode === 'manualLatestWindow' || !hadLocalEvents ? 1 : undefined;
       backfillDebug('fireHttpBackfill: requesting', { sessionId: backfillSessionId, phase, mode, afterTs, retryAttempt });
       if (foregroundRound) {
-        httpBackfillInFlightRef.current[mode] += 1;
+        inFlightCounts[mode] += 1;
         updateHistoryStep('http', 'running', phase);
         setHttpRefreshing(true);
       }
@@ -4473,12 +4493,13 @@ export function useTimeline(
       // local tail base); that needs the deferred verified/forward cursor.
       void (async () => {
         let terminal: 'caught_up' | 'cap_hit' | 'truncated' | 'transient_null' | 'error' | null = null;
+        let outcome: Awaited<ReturnType<typeof runNewestWindowBackfill>> | null = null;
         try {
           // The page currently being fetched: `undefined` = the newest window, else a step down the hole.
           let pageBeforeTs: number | undefined;
           // Whether that page arrived payload-trimmed/dropped/reset (the pager ends such a round `truncated`).
           let pageIncomplete = false;
-          const outcome = await runNewestWindowBackfill(afterTs, {
+          outcome = await runNewestWindowBackfill(afterTs, {
             limit: MAX_FORWARD_PAGE_EVENTS,
             maxPages,
             // Only the hole's own round resumes at its stitched top; a manual newest-window refresh starts at the newest.
@@ -4495,7 +4516,7 @@ export function useTimeline(
               return page;
             },
             mergePage: async (events) => {
-              if (cacheKeyRef.current !== backfillCacheKey) return { candidateCount: 0, minTs: null, maxTs: null };
+              if (scopeGenerationRef.current !== roundGeneration || cacheKeyRef.current !== backfillCacheKey) return { candidateCount: 0, minTs: null, maxTs: null };
               const recovered = events.filter(
                 (ev): ev is TimelineEvent => !!ev && typeof ev === 'object'
                   && typeof (ev as TimelineEvent).eventId === 'string'
@@ -4515,16 +4536,17 @@ export function useTimeline(
               // While a hole is open the window must keep what it fills in, not only the newest 300.
               const wideMerge = !!backfillCacheKey && !!getTimelineGap(backfillCacheKey);
               // This very page just revealed the hole: from here on this round is its filler.
-              if (wideMerge && !holdsGapFiller && mode !== 'manualLatestWindow') {
+              if (wideMerge && !holdsGapFiller && mode !== 'manualLatestWindow' && backfillCacheKey) {
                 holdsGapFiller = true;
-                gapBackfillInFlight.add(backfillCacheKey!);
+                heldFillerToken = Symbol('gapFiller');
+                gapBackfillInFlight.set(backfillCacheKey, heldFillerToken);
               }
               // Apply large pages in small turns.  A 200-event page can carry
               // megabytes of markdown/tool payload; merging it synchronously
               // blocks input and first paint across every mounted pane.
               const APPLY_CHUNK = 20;
               for (let offset = 0; offset < recovered.length; offset += APPLY_CHUNK) {
-                if (cacheKeyRef.current !== backfillCacheKey) return { candidateCount: 0, minTs: null, maxTs: null };
+                if (scopeGenerationRef.current !== roundGeneration || cacheKeyRef.current !== backfillCacheKey) return { candidateCount: 0, minTs: null, maxTs: null };
                 const chunk = recovered.slice(offset, offset + APPLY_CHUNK);
                 mergeEvents(chunk, wideMerge ? MAX_HISTORY_EVENTS : undefined);
                 for (const recoveredEvent of chunk) {
@@ -4541,6 +4563,12 @@ export function useTimeline(
               for (const recoveredEvent of recovered) {
                 if (recoveredEvent.ts < minTs) minTs = recoveredEvent.ts;
                 if (recoveredEvent.ts > maxTs) maxTs = recoveredEvent.ts;
+              }
+              if (
+                scopeGenerationRef.current !== roundGeneration
+                || cacheKeyRef.current !== backfillCacheKey
+              ) {
+                return { candidateCount: 0, minTs: null, maxTs: null };
               }
               if (backfillCacheKey && Number.isFinite(minTs) && Number.isFinite(maxTs)) {
                 const currentGap = getTimelineGap(backfillCacheKey);
@@ -4577,6 +4605,12 @@ export function useTimeline(
               };
             },
           });
+          if (
+            scopeGenerationRef.current !== roundGeneration
+            || cacheKeyRef.current !== backfillCacheKey
+          ) {
+            return;
+          }
           terminal = outcome.terminal;
           // The window down to the floor is exhausted: the hole is filled.
           if (terminal === 'caught_up' && backfillCacheKey && mode !== 'manualLatestWindow') {
@@ -4592,6 +4626,7 @@ export function useTimeline(
               sessionId: backfillSessionId, roundsChained: roundsChained + 1,
             });
             setTimeout(() => {
+              if (scopeGenerationRef.current !== roundGeneration || cacheKeyRef.current !== backfillCacheKey) return;
               fireHttpBackfillRef.current(0, {
                 ...opts,
                 visible: false,
@@ -4609,6 +4644,7 @@ export function useTimeline(
               const delay = HTTP_BACKFILL_RETRY_DELAYS_MS[retryAttempt];
               backfillDebug('fireHttpBackfill: null result → retry', { sessionId: backfillSessionId, retryAttempt: retryAttempt + 1, delayMs: delay });
               setTimeout(() => {
+                if (scopeGenerationRef.current !== roundGeneration || cacheKeyRef.current !== backfillCacheKey) return;
                 fireHttpBackfillRef.current(0, { ...opts, _retryAttempt: retryAttempt + 1 });
               }, delay);
             } else {
@@ -4627,23 +4663,25 @@ export function useTimeline(
           // While a hole is recorded, ITS filler owns the walk down: an unbounded newest-window refresh must not
           // chain a second walker past the hole's floor.
           const manualRoundDuringHole = mode === 'manualLatestWindow' && !!backfillCacheKey && !!getTimelineGap(backfillCacheKey);
-          if (outcome.terminal === 'cap_hit' && outcome.resumeBeforeTs !== undefined
+          const nextResumeBeforeTs = outcome.resumeBeforeTs;
+          if (outcome.terminal === 'cap_hit' && nextResumeBeforeTs !== undefined
             && hadLocalEvents
             && !manualRoundDuringHole
             && roundsChained < CATCHUP_TAIL_MAX_ROUNDS) {
             backfillDebug('fireHttpBackfill: cap_hit → chaining next round', {
-              sessionId: backfillSessionId, roundsChained: roundsChained + 1, resumeBeforeTs: outcome.resumeBeforeTs,
+              sessionId: backfillSessionId, roundsChained: roundsChained + 1, resumeBeforeTs: nextResumeBeforeTs,
             });
             setTimeout(() => {
+              if (scopeGenerationRef.current !== roundGeneration || cacheKeyRef.current !== backfillCacheKey) return;
               fireHttpBackfillRef.current(0, {
                 ...opts,
                 visible: false,
-                _resumeBeforeTs: outcome.resumeBeforeTs,
+                _resumeBeforeTs: nextResumeBeforeTs,
                 _roundsChained: roundsChained + 1,
                 _retryAttempt: 0,
               });
             }, CATCHUP_TAIL_CHAIN_DELAY_MS);
-          } else if (outcome.terminal === 'cap_hit' && outcome.resumeBeforeTs !== undefined) {
+          } else if (outcome.terminal === 'cap_hit' && nextResumeBeforeTs !== undefined) {
             backfillDebug('fireHttpBackfill: cap_hit → round budget exhausted, giving up for now', {
               sessionId: backfillSessionId, roundsChained,
             });
@@ -4657,30 +4695,75 @@ export function useTimeline(
           /* opportunistic — WS path is primary */
         }
         finally {
-          if (holdsGapFiller && backfillCacheKey) gapBackfillInFlight.delete(backfillCacheKey);
+          if (holdsGapFiller && backfillCacheKey && heldFillerToken) {
+            if (gapBackfillInFlight.get(backfillCacheKey) === heldFillerToken) {
+              gapBackfillInFlight.delete(backfillCacheKey);
+            }
+          }
           if (gate) {
             gate.inFlight = Math.max(0, gate.inFlight - 1);
-            if (terminal === 'error' || terminal === 'transient_null') {
-              gate.failureStreak += 1;
-              gate.nextAllowedAt = Date.now() + Math.min(
-                BACKGROUND_BACKFILL_FAILURE_BACKOFF_BASE_MS * 2 ** (gate.failureStreak - 1),
-                BACKGROUND_BACKFILL_FAILURE_BACKOFF_MAX_MS,
-              );
-            } else if (terminal !== null) {
-              gate.failureStreak = 0;
-              gate.nextAllowedAt = 0;
+            if (
+              scopeGenerationRef.current === roundGeneration
+              && cacheKeyRef.current === backfillCacheKey
+            ) {
+              if (terminal === 'error' || terminal === 'transient_null') {
+                gate.failureStreak += 1;
+                gate.nextAllowedAt = Date.now() + Math.min(
+                  BACKGROUND_BACKFILL_FAILURE_BACKOFF_BASE_MS * 2 ** (gate.failureStreak - 1),
+                  BACKGROUND_BACKFILL_FAILURE_BACKOFF_MAX_MS,
+                );
+              } else if (terminal === 'caught_up') {
+                gate.failureStreak = 0;
+                gate.nextAllowedAt = 0;
+              }
             }
           }
           if (foregroundRound) {
-            httpBackfillInFlightRef.current[mode] = Math.max(0, httpBackfillInFlightRef.current[mode] - 1);
-            // The foreground contract ends when the newest page settles.
-            // Continuation rounds are intentionally invisible and must not
-            // leave a permanent spinner on a chat that already has content.
-            const foregroundState = terminal === 'transient_null'
-              ? (retryAttempt >= HTTP_BACKFILL_RETRY_DELAYS_MS.length ? 'offline' : 'pending')
-              : terminal === 'error' ? 'offline' : 'done';
-            updateHistoryStep('http', foregroundState, phase);
-            if (totalHttpBackfillInFlight(httpBackfillInFlightRef.current) === 0) setHttpRefreshing(false);
+            inFlightCounts[mode] = Math.max(0, inFlightCounts[mode] - 1);
+            if (
+              scopeGenerationRef.current === roundGeneration
+              && httpBackfillInFlightRef.current === inFlightCounts
+            ) {
+              if (totalHttpBackfillInFlight(inFlightCounts) === 0) setHttpRefreshing(false);
+            }
+          }
+          if (
+            scopeGenerationRef.current === roundGeneration
+            && cacheKeyRef.current === backfillCacheKey
+          ) {
+            if (foregroundRound) {
+              const foregroundState = terminal === 'transient_null'
+                ? (retryAttempt >= HTTP_BACKFILL_RETRY_DELAYS_MS.length ? 'offline' : 'pending')
+                : terminal === 'error' ? 'offline' : 'done';
+              updateHistoryStep('http', foregroundState, phase);
+              if (terminal === 'caught_up') {
+                if (errorSequenceRef.current === roundStartedErrorSeq) {
+                  setHistoryStatus((prev) => (prev.response?.state === 'error' ? { ...prev, response: null } : prev));
+                }
+              } else if (
+                terminal === 'error'
+                || (terminal === 'transient_null' && retryAttempt >= HTTP_BACKFILL_RETRY_DELAYS_MS.length)
+              ) {
+                errorSequenceRef.current += 1;
+                setHistoryStatus((prev) => {
+                  if (prev.steps.daemon === 'done' && prev.response?.state !== 'error') return prev;
+                  return {
+                    ...prev,
+                    response: {
+                      state: 'error',
+                      i18nKey: 'chat.timelineStatus.error',
+                      localizedMessage: localizedTimelineNotice('chat.timelineStatus.error'),
+                      recoverable: true,
+                      source: 'http',
+                    },
+                  };
+                });
+              }
+            } else if (terminal === 'caught_up') {
+              if (errorSequenceRef.current === roundStartedErrorSeq) {
+                setHistoryStatus((prev) => (prev.response?.state === 'error' ? { ...prev, response: null } : prev));
+              }
+            }
           }
         }
       })();
@@ -5701,6 +5784,7 @@ export function useTimeline(
 
   useEffect(() => {
     return () => {
+      scopeGenerationRef.current += 1;
       if (daemonWaitTimerRef.current) {
         clearTimeout(daemonWaitTimerRef.current);
         daemonWaitTimerRef.current = null;

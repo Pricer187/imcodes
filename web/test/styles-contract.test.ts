@@ -84,6 +84,20 @@ describe('styles.css regression contracts', () => {
     : '';
   const cssWithoutComments = css.replace(/\/\*[\s\S]*?\*\//g, '');
 
+  it('keeps compact decision copy a native five-line scrollport and contains only overflowing copy', () => {
+    const text = css.match(/\.task-pair-decision-copy \.expandable-task-objective-text\s*\{[^}]*\}/)?.[0];
+    expect(text).toMatch(/overflow-y:\s*auto/);
+    expect(text).toMatch(/user-select:\s*text/);
+    const compact = css.match(/\.task-pair-decision-copy \.expandable-task-objective-text\.is-measuring-clamped\s*\{[^}]*\}/)?.[0];
+    expect(compact).toMatch(/display:\s*block/);
+    expect(compact).toMatch(/max-height:\s*7\.5em/);
+    expect(compact).toMatch(/min-height:\s*0/);
+    expect(compact).toMatch(/-webkit-line-clamp:\s*unset/);
+    const contained = css.match(/\.task-pair-decision-copy\[data-objective-overflow="true"\] \.expandable-task-objective-text\s*\{[^}]*\}/)?.[0];
+    expect(contained).toMatch(/overscroll-behavior-y:\s*contain/);
+    expect(css).not.toMatch(/\.task-pair-decision-copy \.expandable-task-objective-text\s*\{[^}]*overscroll-behavior[^}]*contain/);
+  });
+
   it('keeps the desktop rail exactly one bottom card wide and its vertical cards compact and scrollable', () => {
     const rootRule = cssWithoutComments.match(/:root\s*\{[^}]*\}/)?.[0];
     expect(rootRule).toMatch(/--subsession-compact-card-width:\s*54px/);
@@ -994,7 +1008,7 @@ describe('styles.css regression contracts', () => {
     const menuRule = css.match(/\.mobile-server-menu\s*\{[^}]*\}/);
     expect(menuRule).not.toBeNull();
     expect(menuRule![0]).toMatch(/display:\s*grid/);
-    expect(menuRule![0]).toMatch(/grid-template-columns:\s*repeat\(2,\s*minmax\(0,\s*1fr\)\)/);
+    expect(menuRule![0]).toMatch(/grid-template-columns:\s*repeat\(3,\s*minmax\(0,\s*1fr\)\)/);
     expect(menuRule![0]).toMatch(/max-height:\s*calc\(var\(--vvh,\s*100dvh\)\s*-\s*var\(--sat,\s*0px\)\s*-\s*68px\s*-\s*env\(safe-area-inset-bottom,\s*0px\)\)/);
     expect(menuRule![0]).not.toMatch(/max-height:\s*min\(60vh/);
     expect(menuRule![0]).toMatch(/padding-bottom:\s*max\(16px,\s*env\(safe-area-inset-bottom,\s*0px\)\)/);
@@ -1018,23 +1032,36 @@ describe('styles.css regression contracts', () => {
     expect(menuNameRule![0]).toMatch(/text-overflow:\s*ellipsis/);
     expect(menuNameRule![0]).toMatch(/white-space:\s*nowrap/);
 
-    const wideMenuRule = css.match(/@media\s*\(min-width:\s*380px\)\s*\{\s*\.mobile-server-menu\s*\{[^}]*\}\s*\}/);
-    expect(wideMenuRule).not.toBeNull();
-    expect(wideMenuRule![0]).toMatch(/grid-template-columns:\s*repeat\(3,\s*minmax\(0,\s*1fr\)\)/);
+    expect(menuRule![0]).toMatch(/grid-auto-rows:\s*max-content/);
+    expect(menuRule![0]).toMatch(/align-content:\s*start/);
+    expect(menuRule![0]).toMatch(/overflow-y:\s*auto/);
+    expect(sharedEntriesRule![0]).toMatch(/overflow:\s*visible/);
+    const sharedGrid = css.match(/\.mobile-server-menu-shared \.shared-entries-list\s*\{[^}]*\}/);
+    expect(sharedGrid?.[0]).toMatch(/grid-template-columns:\s*repeat\(3,\s*minmax\(0,\s*1fr\)\)/);
+    expect(sharedGrid?.[0]).toMatch(/max-height:\s*none/);
+    expect(sharedGrid?.[0]).toMatch(/overflow:\s*visible/);
 
     const app = readFileSync(resolve(__dirname, '../src/app.tsx'), 'utf8');
     expect(app).toContain('mobile-server-menu-server');
     expect(app).toContain('mobile-server-menu-language');
     expect(app).toContain('server-item-pin');
-    expect(app).toContain('mobile-server-menu-pin');
+    expect(app).not.toContain('mobile-server-menu-pin');
+    expect(app).toContain("? ' pinned'");
     expect(app).toContain('pinnedServerIds');
 
     const serverPinRule = css.match(/\.server-item-pin\s*\{[^}]*\}/);
     expect(serverPinRule).not.toBeNull();
     expect(serverPinRule![0]).toMatch(/flex:\s*0\s+0\s+auto/);
-    const menuPinRule = css.match(/\.mobile-server-menu-pin\s*\{[^}]*\}/);
-    expect(menuPinRule).not.toBeNull();
-    expect(menuPinRule![0]).toMatch(/flex:\s*0\s+0\s+auto/);
+    const mobilePinnedRule = css.match(/\.mobile-server-menu-server\.pinned\s*\{[^}]*\}/);
+    expect(mobilePinnedRule).not.toBeNull();
+    expect(mobilePinnedRule![0]).toMatch(/position:\s*relative/);
+    expect(mobilePinnedRule![0]).toMatch(/box-shadow:\s*inset\s+2px\s+0\s+0/);
+    expect(mobilePinnedRule![0]).not.toMatch(/border:/);
+    expect(mobilePinnedRule![0]).toMatch(/rgb\(74 222 128/);
+    const mobilePinnedLineRule = css.match(/\.mobile-server-menu-server\.pinned::after\s*\{[^}]*\}/);
+    expect(mobilePinnedLineRule).not.toBeNull();
+    expect(mobilePinnedLineRule![0]).toMatch(/height:\s*1px/);
+    expect(mobilePinnedLineRule![0]).toMatch(/linear-gradient/);
     const iconPinRule = css.match(/\.server-icon-pin\s*\{[^}]*\}/);
     expect(iconPinRule).not.toBeNull();
     expect(iconPinRule![0]).toMatch(/position:\s*absolute/);

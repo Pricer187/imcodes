@@ -255,6 +255,27 @@ describe('SubSessionWindow metadata wiring', () => {
     }
   });
 
+  it('always scopes task pairs to its canonical session and forwards a separate split visit key', () => {
+    const baseProps = {
+      sub: makeSubSession({ type: 'codex-sdk' }),
+      ws,
+      connected: true,
+      active: true,
+      onDiff: vi.fn(),
+      onHistory: vi.fn(),
+      onMinimize: vi.fn(),
+      onClose: vi.fn(),
+      onRestart: vi.fn(),
+      onRename: vi.fn(),
+      zIndex: 1,
+      onFocus: vi.fn(),
+    };
+    const view = render(<SubSessionWindow {...baseProps} />);
+    expect(chatViewPropsSpy.mock.calls.at(-1)?.[0].scopeTaskPairs).toBe(true);
+    view.rerender(<SubSessionWindow {...baseProps} taskPairPanelVisitKey="split-task" />);
+    expect(chatViewPropsSpy.mock.calls.at(-1)?.[0]).toMatchObject({ scopeTaskPairs: true, sessionId: baseProps.sub.sessionName, taskPairPanelVisitKey: 'split-task' });
+  });
+
   it('projects canonical peer-audit identity/model metadata into SessionControls', () => {
     render(
       <SubSessionWindow

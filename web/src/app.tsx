@@ -50,6 +50,7 @@ import { PENDING_START_TIMEOUT_MS, DISCUSSION_RECONCILE_HIDDEN_MS } from '@share
 import { LOGIN_SESSION_NOT_STUCK_KEY } from './login-session-not-stuck.js';
 import { useTranslation } from 'react-i18next';
 import { ErrorBoundary } from './components/ErrorBoundary.js';
+import { MobileServerMenu } from './components/MobileServerMenu.js';
 import { LanguageSwitcher } from './components/LanguageSwitcher.js';
 import { LoginPage } from './pages/LoginPage.js';
 import { isActiveTurnFinishedError } from './session-live-status.js';
@@ -234,7 +235,7 @@ import {
 } from './onboarding.js';
 // useSwipeBack now handled inside FloatingPanel for discussion/repo pages
 import { WsClient, type P2pWorkflowRequestScope } from './ws-client.js';
-import { configure as configureApi, configureExpectedUserId, apiFetch, onAuthExpired, startProactiveRefresh, stopProactiveRefresh, refreshSessionIfStale, ApiError, configureApiKey, clearApiKey, fetchMe, getApiKey, normalizeLocalWebPreviewPath, listP2pRuns, discoverSharedEntries, openSharedEntry, listManagedSharesForServer, type SharedEntrySummary } from './api.js';
+import { configure as configureApi, configureExpectedUserId, apiFetch, onAuthExpired, startProactiveRefresh, stopProactiveRefresh, refreshSessionIfStale, ApiError, configureApiKey, clearApiKey, fetchMe, getApiKey, normalizeLocalWebPreviewPath, listP2pRuns, discoverSharedEntries, openSharedEntry, SharedOpenTimeoutError, listManagedSharesForServer, type SharedEntrySummary } from './api.js';
 import { isNative, getServerUrl, clearServerUrl } from './native.js';
 import { recordPerfRender } from './perf-render-debug.js';
 import { isMobileDevice } from './mobile-device.js';
@@ -285,6 +286,7 @@ import { buildDocumentTitle } from './tab-title.js';
 import {
   getDaemonBadgeState,
   getSelectedServerName,
+  mergeServerNavigation,
   hasResolvedActiveSession,
   isServerOnline,
   pickAutoEntryServer,
@@ -572,10 +574,33 @@ interface WatchSessionRow {
   isSubSession?: boolean;
 }
 
-function formatSharedAccessError(error: unknown): string {
-  if (error instanceof ApiError) return error.body || error.message;
-  if (error instanceof Error) return error.message;
-  return String(error || 'share_failed');
+function formatSharedAccessError(
+  error: unknown,
+  t?: (key: string, options?: any) => string,
+): string {
+  if (error instanceof SharedOpenTimeoutError || (error instanceof Error && error.name === 'SharedOpenTimeoutError')) {
+    return t ? t('share.sharedWithMe.openTimeout') : 'Opening shared access timed out. Please try again.';
+  }
+  if (error instanceof ApiError) {
+    try {
+      const parsed = JSON.parse(error.body) as { reason?: unknown; error?: unknown };
+      if (typeof parsed?.reason === 'string') {
+        const reasonKey = `share.reason.${parsed.reason}`;
+        if (t) {
+          const translated = t(reasonKey);
+          if (translated && translated !== reasonKey) return translated;
+        }
+      }
+    } catch { /* ignore JSON parse error */ }
+    return error.body || error.message;
+  }
+  if (error instanceof Error) {
+    if (error.name === 'AbortError') {
+      return '';
+    }
+    return error.message;
+  }
+  return String(error || (t ? t('share.sharedWithMe.openFailed') : 'share_failed'));
 }
 
 function sharedEntryFallbackFromHash(
@@ -690,6 +715,18 @@ function settingsIdentityProjectKey(
 /** Token-usage bars refresh at most this often; the newest value always wins. */
 const SUB_USAGE_COMMIT_INTERVAL_MS = 250;
 
+interface SharedOpenIntent {
+  generation: number;
+  entryId: string;
+  targetKind: string;
+  serverId: string;
+  preferredSessionName: string | null;
+  subSessionId?: string;
+  source: 'ui' | 'external' | 'startup';
+}
+
+type SharedOpenResultStatus = 'opened' | 'superseded' | 'denied' | 'duplicate';
+
 export function App() {
   recordPerfRender('App');
   const { t: trans } = useTranslation();
@@ -700,9 +737,22 @@ export function App() {
   const remoteDesktopConnectionManager = remoteDesktopConnectionManagerRef.current;
   /** Server ids this account actually owns, sourced only from /api/server. */
   const ownedServerIdsRef = useRef<Set<string>>(new Set());
+  // Only successful share discovery updates this set; a transient fetch failure
+  // must not erase navigation back to a server the user just left.
+  const sharedNavigationServerIdsRef = useRef<Set<string>>(new Set());
   const initialHashStateRef = useRef(resolveInitialRouteState());
   const initialSharedTabRestoreRef = useRef(readSharedTabRestoreMarker());
   const sharedOpenGenerationRef = useRef(0);
+  const sharedOpenAbortRef = useRef<AbortController | null>(null);
+  const sharedOpenIntentRef = useRef<SharedOpenIntent | null>(null);
+  useEffect(() => {
+    return () => {
+      sharedOpenAbortRef.current?.abort();
+      sharedOpenAbortRef.current = null;
+      sharedOpenGenerationRef.current += 1;
+      sharedOpenIntentRef.current = null;
+    };
+  }, []);
   /** Invalidates asynchronous external-route authorization after a newer navigation. */
   const externalRouteGenerationRef = useRef(0);
   /** Deduplicates the hashchange/popstate pair emitted for one route transition. */
@@ -822,7 +872,13 @@ export function App() {
     const releaseCleanupGate = holdAuthCredentialCleanupGate();
     authMutationGenerationRef.current += 1;
     const staleAuthAttempts = [...activeAuthAttemptSettlementsRef.current];
+    sharedOpenAbortRef.current?.abort();
+    sharedOpenAbortRef.current = null;
     sharedOpenGenerationRef.current += 1;
+    sharedOpenIntentRef.current = null;
+    externalRouteGenerationRef.current += 1;
+    externalRouteInFlightKeyRef.current = null;
+    setOpeningSharedEntryId(null);
     clearApiKey();
     configureExpectedUserId(null);
     localStorage.removeItem('rcc_auth');
@@ -837,6 +893,7 @@ export function App() {
     setAuth(null);
     setServers([]);
     ownedServerIdsRef.current = new Set();
+    sharedNavigationServerIdsRef.current = new Set();
     setServersLoaded(false);
     setServersSynced(false);
     setSessions([]);
@@ -1635,20 +1692,24 @@ export function App() {
     }
   }, [selectedServerId, trans]);
 
+  const applyServerInventory = useCallback((incoming: ServerInfo[]) => {
+    // Authoritative ownership, kept apart from `servers` on purpose.
+    // `handleOpenSharedEntry` merges the shared server into `servers` so the
+    // rest of the UI can render it, which makes that array a MIXED inventory:
+    // membership there proves the app has seen a server, never that this
+    // account owns it. Ownership decides whether a route may skip the
+    // /api/shares/open coverage check, so it must come from /api/server and
+    // nowhere else.
+    ownedServerIdsRef.current = new Set(incoming.map((server) => server.id));
+    setServers((previous) => mergeServerNavigation(incoming, previous, sharedNavigationServerIdsRef.current));
+  }, []);
+
   // Load servers list whenever auth is available
   const loadServers = useCallback(async () => {
     if (!auth) return;
     try {
       const data = await apiFetch<{ servers: ServerInfo[] }>('/api/server');
-      setServers(data.servers);
-      // Authoritative ownership, kept apart from `servers` on purpose.
-      // `handleOpenSharedEntry` merges the shared server into `servers` so the
-      // rest of the UI can render it, which makes that array a MIXED inventory:
-      // membership there proves the app has seen a server, never that this
-      // account owns it. Ownership decides whether a route may skip the
-      // /api/shares/open coverage check, so it must come from /api/server and
-      // nowhere else.
-      ownedServerIdsRef.current = new Set(data.servers.map((server) => server.id));
+      applyServerInventory(data.servers);
       setServersSynced(true);
     } catch {
       // Preserve the last known list on refresh failures. The request is still
@@ -1656,7 +1717,7 @@ export function App() {
     } finally {
       setServersLoaded(true);
     }
-  }, [auth]);
+  }, [auth, applyServerInventory]);
 
   useEffect(() => {
     setServersLoaded(false);
@@ -1693,10 +1754,16 @@ export function App() {
     setSharedEntriesLoaded(false);
     setSharedEntriesError(null);
     try {
-      setSharedEntries(await discoverSharedEntries());
+      const entries = await discoverSharedEntries();
+      const activeIds = new Set(entries.filter((entry) => entry.status === 'active').map((entry) => entry.serverId));
+      sharedNavigationServerIdsRef.current = activeIds;
+      setSharedEntries(entries);
+      // A successful refresh can revoke a previous shortcut; failed requests
+      // leave the last known navigation intact, never granting route authority.
+      setServers((previous) => previous.filter((server) => ownedServerIdsRef.current.has(server.id) || activeIds.has(server.id)));
     } catch (err) {
       setSharedEntries([]);
-      setSharedEntriesError(formatSharedAccessError(err));
+      setSharedEntriesError(formatSharedAccessError(err, trans));
     } finally {
       setSharedEntriesLoading(false);
       setSharedEntriesLoaded(true);
@@ -2045,7 +2112,7 @@ export function App() {
   const openSubIdsRef = useRef(openSubIds);
   openSubIdsRef.current = openSubIds;
   const activeSplitPairRef = useRef<{ taskId: string; executorSubId: string; auditorSubId: string } | null>(null);
-  const [, setActiveSplitPairTaskId] = useState<string | null>(null);
+  const [activeSplitPairTaskId, setActiveSplitPairTaskId] = useState<string | null>(null);
   const persistOpenSubIds = useCallback((next: Set<string>) => {
     const mainSession = openSubPersistenceSessionRef.current;
     if (!mainSession) return;
@@ -3056,7 +3123,10 @@ export function App() {
   };
 
   const claimExplicitSessionNavigation = useCallback((name: string) => {
+    sharedOpenAbortRef.current?.abort();
+    sharedOpenAbortRef.current = null;
     sharedOpenGenerationRef.current += 1;
+    sharedOpenIntentRef.current = null;
     externalRouteGenerationRef.current += 1;
     externalRouteInFlightKeyRef.current = null;
     setOpeningSharedEntryId(null);
@@ -3435,9 +3505,47 @@ export function App() {
 
   const handleOpenSharedEntry = useCallback(async (
     entry: SharedEntrySummary,
-    options?: { restoreFromHash?: boolean; preferredSessionName?: string | null },
-  ) => {
-    if (openingSharedEntryId) return false;
+    options?: {
+      restoreFromHash?: boolean;
+      preferredSessionName?: string | null;
+      source?: 'ui' | 'external' | 'startup';
+    },
+  ): Promise<SharedOpenResultStatus> => {
+    const preferredSession = options?.preferredSessionName
+      ?? (entry.target.kind === 'main' ? entry.target.sessionName : null);
+    const subSessionId = entry.target.kind === 'subsession' ? entry.target.subSessionId : undefined;
+
+    const currentIntent = sharedOpenIntentRef.current;
+    if (
+      currentIntent !== null
+      && currentIntent.entryId === entry.id
+      && currentIntent.targetKind === entry.target.kind
+      && currentIntent.preferredSessionName === preferredSession
+      && currentIntent.subSessionId === subSessionId
+    ) {
+      return 'duplicate';
+    }
+
+    sharedOpenAbortRef.current?.abort();
+    const abortController = new AbortController();
+    sharedOpenAbortRef.current = abortController;
+    const openGeneration = ++sharedOpenGenerationRef.current;
+
+    const source = options?.source ?? (options?.restoreFromHash ? 'startup' : 'ui');
+    if (source !== 'external') {
+      externalRouteGenerationRef.current += 1;
+      externalRouteInFlightKeyRef.current = null;
+    }
+
+    sharedOpenIntentRef.current = {
+      generation: openGeneration,
+      entryId: entry.id,
+      targetKind: entry.target.kind,
+      serverId: entry.serverId,
+      preferredSessionName: preferredSession,
+      subSessionId,
+      source,
+    };
     const returnServer = options?.restoreFromHash
       ? null
       : selectedShareTarget
@@ -3452,10 +3560,9 @@ export function App() {
         : null;
     setOpeningSharedEntryId(entry.id);
     setSharedEntriesError(null);
-    const openGeneration = sharedOpenGenerationRef.current;
     try {
-      const opened = await openSharedEntry(entry.target);
-      if (openGeneration !== sharedOpenGenerationRef.current) return false;
+      const opened = await openSharedEntry(entry.target, { signal: abortController.signal });
+      if (openGeneration !== sharedOpenGenerationRef.current) return 'superseded';
       const nextServer: ServerInfo = {
         id: opened.server.id,
         name: opened.server.name,
@@ -3537,17 +3644,33 @@ export function App() {
       }
       setShowMobileServerMenu(false);
       setMobileSidebarOpen(false);
-      return true;
+
+      const nextRoute = {
+        serverId: opened.server.id,
+        sessionName: activeFromTarget,
+        sharedEntryId: entry.id,
+      };
+      initialHashStateRef.current = nextRoute;
+      sharedHashRestoreStartedRef.current = true;
+      setSharedHashRestorePending(false);
+      writeHashState(nextRoute.serverId, nextRoute.sessionName, nextRoute.sharedEntryId);
+
+      return 'opened';
     } catch (err) {
-      if (openGeneration !== sharedOpenGenerationRef.current) return false;
-      setSharedEntriesError(formatSharedAccessError(err));
-      return false;
+      if (openGeneration !== sharedOpenGenerationRef.current) return 'superseded';
+      if (abortController.signal.aborted && !(err instanceof SharedOpenTimeoutError)) {
+        return 'superseded';
+      }
+      setSharedEntriesError(formatSharedAccessError(err, trans));
+      return 'denied';
     } finally {
       if (openGeneration === sharedOpenGenerationRef.current) {
+        sharedOpenIntentRef.current = null;
+        sharedOpenAbortRef.current = null;
         setOpeningSharedEntryId(null);
       }
     }
-  }, [hydrateSharedSubSessions, openingSharedEntryId, resolvedSelectedServerName, selectedServerId, selectedShareTarget, servers, setActiveSession, sharedReturnServer]);
+  }, [hydrateSharedSubSessions, resolvedSelectedServerName, selectedServerId, selectedShareTarget, servers, setActiveSession, sharedReturnServer, trans]);
 
   useEffect(() => {
     if (initialAuthVerificationPending || !sharedHashRestorePending || !auth || !serversLoaded) return;
@@ -3600,8 +3723,9 @@ export function App() {
     void handleOpenSharedEntry(entry, {
       restoreFromHash: true,
       preferredSessionName: initial.sessionName,
-    }).then((restored) => {
-      if (restored || !urlSharedEntryId) {
+      source: 'startup',
+    }).then((result) => {
+      if (result === 'opened' || !urlSharedEntryId) {
         setSharedHashRestorePending(false);
       }
     });
@@ -5503,7 +5627,12 @@ export function App() {
     // User intent to leave is authoritative immediately; a shared-open response
     // that settles while logout I/O is pending must not restore the old route.
     authMutationGenerationRef.current += 1;
+    sharedOpenAbortRef.current?.abort();
+    sharedOpenAbortRef.current = null;
     sharedOpenGenerationRef.current += 1;
+    sharedOpenIntentRef.current = null;
+    externalRouteGenerationRef.current += 1;
+    externalRouteInFlightKeyRef.current = null;
     setOpeningSharedEntryId(null);
     if (isNative()) {
       // Native: revoke API key server-side, clear biometric storage
@@ -5533,6 +5662,9 @@ export function App() {
     clearMessagePinNavigation();
     configureExpectedUserId(null);
     setAuth(null);
+    setServers([]);
+    ownedServerIdsRef.current = new Set();
+    sharedNavigationServerIdsRef.current = new Set();
     setSessions([]);
     setActiveSession(null);
     setSelectedServerId(null);
@@ -5553,6 +5685,13 @@ export function App() {
   // again can restore the session after a fresh /me authority check.
   const handleChangeServer = useCallback(async () => {
     setShowMobileServerMenu(false);
+    sharedOpenAbortRef.current?.abort();
+    sharedOpenAbortRef.current = null;
+    sharedOpenGenerationRef.current += 1;
+    sharedOpenIntentRef.current = null;
+    externalRouteGenerationRef.current += 1;
+    externalRouteInFlightKeyRef.current = null;
+    setOpeningSharedEntryId(null);
     // Both authenticated and LoginPage-initiated switching must keep the gate
     // held through clearServerUrl. Otherwise handleLogout can render the old
     // server's LoginPage after setAuth(null), allowing a fresh credential write
@@ -5575,7 +5714,10 @@ export function App() {
   }, [auth?.baseUrl, clearAuthState, holdAuthCredentialCleanupGate, nativeServerUrl]);
 
   const handleSelectServer = useCallback(async (serverId: string, serverName?: string) => {
+    sharedOpenAbortRef.current?.abort();
+    sharedOpenAbortRef.current = null;
     sharedOpenGenerationRef.current += 1;
+    sharedOpenIntentRef.current = null;
     externalRouteGenerationRef.current += 1;
     externalRouteInFlightKeyRef.current = null;
     setOpeningSharedEntryId(null);
@@ -5698,7 +5840,10 @@ export function App() {
         // had already left.
         if (externalRouteInFlightKeyRef.current !== null) {
           externalRouteInFlightKeyRef.current = null;
+          sharedOpenAbortRef.current?.abort();
+          sharedOpenAbortRef.current = null;
           sharedOpenGenerationRef.current += 1;
+          sharedOpenIntentRef.current = null;
           externalRouteGenerationRef.current += 1;
           setOpeningSharedEntryId(null);
         }
@@ -5708,7 +5853,10 @@ export function App() {
 
       // An external navigation is an explicit user intent and outranks any
       // shared-open still in flight, exactly like the in-app navigation paths.
+      sharedOpenAbortRef.current?.abort();
+      sharedOpenAbortRef.current = null;
       sharedOpenGenerationRef.current += 1;
+      sharedOpenIntentRef.current = null;
       setOpeningSharedEntryId(null);
       // Auto-entry treats a null selection as "nobody has chosen yet" and picks
       // a server on the user's behalf. Clearing the selection to fail closed
@@ -5778,11 +5926,11 @@ export function App() {
         return;
       }
 
-      void handleOpenSharedEntry(entry, { preferredSessionName: route.sessionName })
-        .then((opened) => {
+      void handleOpenSharedEntry(entry, { preferredSessionName: route.sessionName, source: 'external' })
+        .then((result) => {
           if (externalRouteInFlightKeyRef.current === routeKey) externalRouteInFlightKeyRef.current = null;
           if (generation !== externalRouteGenerationRef.current) return;
-          if (opened) return;
+          if (result === 'opened' || result === 'superseded' || result === 'duplicate') return;
           // Expired/revoked/cross-user share: the server refused. Tear the
           // privileged surface down instead of leaving it on screen.
           failClosedToDashboard();
@@ -5999,9 +6147,11 @@ export function App() {
       return;
     }
 
-    if (activeSplitPairRef.current && activeSplitPairRef.current.taskId !== taskId) {
-      minimizeSubSessionWindow(activeSplitPairRef.current.executorSubId);
-      minimizeSubSessionWindow(activeSplitPairRef.current.auditorSubId);
+    // Minimizing the first pane clears activeSplitPairRef: capture both ids before that callback.
+    const previousSplit = activeSplitPairRef.current;
+    if (previousSplit && previousSplit.taskId !== taskId) {
+      minimizeSubSessionWindow(previousSplit.executorSubId);
+      minimizeSubSessionWindow(previousSplit.auditorSubId);
     }
 
     const bounds = getDesktopMaximizeBounds() ?? reserveWorkspaceBottom(viewportWorkspaceBelowSessionTabs({
@@ -6123,7 +6273,12 @@ export function App() {
   }, [getDesktopMaximizeBounds, isMobile]);
 
   const handleBackToDashboard = useCallback(() => {
+    sharedOpenAbortRef.current?.abort();
+    sharedOpenAbortRef.current = null;
     sharedOpenGenerationRef.current += 1;
+    sharedOpenIntentRef.current = null;
+    externalRouteGenerationRef.current += 1;
+    externalRouteInFlightKeyRef.current = null;
     setOpeningSharedEntryId(null);
     autoEntryRunRef.current++;
     setManualDashboard(true);
@@ -7114,7 +7269,7 @@ export function App() {
                 onDeleteServer={(server) => setDeleteTarget(server)}
                 onLogout={handleLogout}
                 onOpenUsageSummary={() => setShowUsageSummaryPage(true)}
-                onServersLoaded={setServers}
+                onServersLoaded={applyServerInventory}
                 sharedEntries={sharedEntries}
                 sharedEntriesLoading={sharedEntriesLoading}
                 sharedEntriesLoaded={sharedEntriesLoaded}
@@ -7143,7 +7298,7 @@ export function App() {
                 </button>
                 {showMobileServerMenu && (
                   <>
-                  <div class="mobile-server-menu">
+                  <MobileServerMenu>
                     <button class="mobile-server-menu-item" onClick={() => { setShowMobileServerMenu(false); handleBackToDashboard(); }}>
                       ← Home
                     </button>
@@ -7167,20 +7322,11 @@ export function App() {
                       return (
                         <button
                           key={s.id}
-                          class={`mobile-server-menu-item mobile-server-menu-server${s.id === selectedServerId ? ' active' : ''}${showSharedReturnGuide && s.id === sharedReturnServer?.id ? ' server-return-hint' : ''}`}
+                          class={`mobile-server-menu-item mobile-server-menu-server${s.id === selectedServerId ? ' active' : ''}${pinnedServerIds.has(s.id) ? ' pinned' : ''}${showSharedReturnGuide && s.id === sharedReturnServer?.id ? ' server-return-hint' : ''}`}
                           onClick={() => { handleSelectServer(s.id, s.name); setShowMobileServerMenu(false); }}
                           onContextMenu={(e) => { e.preventDefault(); setShowMobileServerMenu(false); setServerCtxMenu({ server: s, x: e.clientX, y: e.clientY }); }}
                         >
                           <span style={{ color: online ? '#4ade80' : '#475569' }}>{online ? '●' : '○'}</span>
-                          {pinnedServerIds.has(s.id) && (
-                            <span
-                              class="mobile-server-menu-pin"
-                              aria-label={trans('session.pinned', { defaultValue: 'Pinned' })}
-                              title={trans('session.pinned', { defaultValue: 'Pinned' })}
-                            >
-                              📌
-                            </span>
-                          )}
                           <span class="mobile-server-menu-name">{s.name}</span>
                           <SharedStateIndicator state={managedSharedServerStateById.get(s.id) ?? null} iconOnly variant="shared-out" />
                         </button>
@@ -7202,7 +7348,7 @@ export function App() {
                     <div class="mobile-server-menu-language" style={{ padding: '6px 12px', borderTop: '1px solid #334155' }}>
                       <LanguageSwitcher />
                     </div>
-                  </div>
+                  </MobileServerMenu>
                   </>
                 )}
               </div>
@@ -8374,6 +8520,7 @@ export function App() {
               remoteDesktopCanSetUp={!selectedShareTarget}
               active={windowVisible && (isMobile || focusedSubId === sub.id)}
               visible={windowVisible}
+              taskPairPanelVisitKey={activeSplitPairRef.current?.executorSubId === sub.id ? activeSplitPairTaskId ?? undefined : undefined}
               onPendingQuestion={surfaceAskQuestionFromHistory}
               idleFlashToken={idleFlashTokens.get(sub.sessionName) ?? 0}
               onDiff={registerDiffApplyer}

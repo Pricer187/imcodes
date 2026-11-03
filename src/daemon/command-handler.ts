@@ -1,3 +1,4 @@
+import { TASK_PAIR_DECISION_MSG } from '../../shared/task-pair-decision.js';
 import { queuedUserMessageAttribution } from '../agent/transport-queued-user-message.js';
 /**
  * Handle commands from the web UI and inbound chat messages via ServerLink.
@@ -55,6 +56,7 @@ import {
   traceWebCommandReceived,
 } from './latency-tracer.js';
 import { getDefaultTimelineHistoryWorkerPool, shouldUseTimelineHistoryWorkerPool, TimelineHistoryPoolError } from './timeline-history-pool.js';
+import { TimelineProjectionBusyError } from './timeline-projection.js';
 import { FsListPoolError, getDefaultFsListWorkerPool, shouldUseFsListWorkerPool } from './fs-list-pool.js';
 import { scanFsListSnapshot } from './fs-list-worker.js';
 import { FsGitStatusPoolError, getDefaultFsGitStatusWorkerPool, shouldUseFsGitStatusWorkerPool, __resetFsGitStatusWorkerPoolForTests } from './fs-git-status-pool.js';
@@ -115,7 +117,7 @@ import type { SharedActorEnvelope } from '../../shared/tab-sharing.js';
 import { TIMELINE_PAYLOAD_BUDGET_BYTES } from '../../shared/timeline-payload-budget.js';
 import { TIMELINE_HISTORY_LIMITS, clampTimelineHistoryLimit, clampTimelineHistoryBudget } from '../../shared/timeline-history-limits.js';
 import { hashSessionName } from '../../shared/session-hash.js';
-import { TIMELINE_DETAIL_ERROR_REASONS, TIMELINE_HISTORY_ERROR_REASONS, TIMELINE_REQUEST_ERROR_REASONS, type TimelineRequestErrorReason } from '../../shared/timeline-history-errors.js';
+import { TIMELINE_DETAIL_ERROR_REASONS, TIMELINE_HISTORY_ERROR_REASONS, TIMELINE_REQUEST_ERROR_REASONS, type TimelineRequestErrorReason, isRecoverableTimelineRequestErrorReason } from '../../shared/timeline-history-errors.js';
 import {
   TIMELINE_CURSOR_DIRECTIONS,
   TIMELINE_TEXT_HISTORY_EVENT_TYPES,
@@ -2463,6 +2465,8 @@ function dispatchWebCommand(cmd: Record<string, unknown>, serverLink: ServerLink
     case SUPERVISION_TASK_CONSOLE_MSG.SUBSCRIBE:
     case SUPERVISION_TASK_CONSOLE_MSG.UNSUBSCRIBE:
     case SUPERVISION_TASK_CONSOLE_MSG.ACK:
+    case TASK_PAIR_DECISION_MSG.HISTORY:
+    case TASK_PAIR_DECISION_MSG.FEEDBACK:
     case SUPERVISION_TASK_CONSOLE_MSG.BRIEF_REQUEST:
       // Already handled: createProductionSupervisionConsoleBinding (wired in
       // lifecycle.ts) registers its OWN serverLink.onMessage handler, and
@@ -6805,6 +6809,7 @@ function sendTimelineReplayError(
   sessionName: string | undefined,
   requestId: string | undefined,
   errorReason: TimelineRequestErrorReason,
+  options?: { recoverable?: boolean },
 ): void {
   try {
     sendTimelineMessage(serverLink, {
@@ -6822,6 +6827,7 @@ function sendTimelineReplayError(
       hasMore: false,
       droppedEvents: 0,
       truncatedEvents: 0,
+      ...(options?.recoverable ? { recoverable: true } : {}),
     });
   } catch { /* not connected */ }
 }
@@ -6961,6 +6967,27 @@ async function handleTimelineReplay(cmd: Record<string, unknown>, serverLink: Se
     });
   } catch (err) {
     logger.warn({ err, sessionName, requestId }, 'timeline.replay_request failed');
+    if (err instanceof TimelinePreferredReadError) {
+      const isRecoverable = TIMELINE_HISTORY_TRANSIENT_REASONS.has(err.reason) || isRecoverableTimelineRequestErrorReason(err.reason);
+      sendTimelineReplayError(
+        serverLink,
+        sessionName,
+        requestId,
+        err.reason as TimelineRequestErrorReason,
+        isRecoverable ? { recoverable: true } : undefined,
+      );
+      return;
+    }
+    if (err instanceof TimelineProjectionBusyError) {
+      sendTimelineReplayError(
+        serverLink,
+        sessionName,
+        requestId,
+        TIMELINE_HISTORY_ERROR_REASONS.PROJECTION_BUSY,
+        { recoverable: true },
+      );
+      return;
+    }
     sendTimelineReplayError(serverLink, sessionName, requestId, TIMELINE_REQUEST_ERROR_REASONS.INTERNAL_ERROR);
   }
 }
@@ -7290,7 +7317,11 @@ async function buildTimelineHistoryOnMain(params: TimelineHistoryRequestParams):
     );
   } catch (err) {
     if (err instanceof TimelinePreferredReadError) {
-      return timelineHistoryErrorResult(err.source, err.reason);
+      const isRecoverable = TIMELINE_HISTORY_TRANSIENT_REASONS.has(err.reason) || isRecoverableTimelineRequestErrorReason(err.reason);
+      return timelineHistoryErrorResult(err.source, err.reason, isRecoverable ? { recoverable: true } : undefined);
+    }
+    if (err instanceof TimelineProjectionBusyError) {
+      return timelineHistoryErrorResult(TIMELINE_RESPONSE_SOURCES.MAIN_SQLITE, TIMELINE_HISTORY_ERROR_REASONS.PROJECTION_BUSY, { recoverable: true });
     }
     throw err;
   }
@@ -7311,7 +7342,11 @@ async function buildTimelineHistoryOnMain(params: TimelineHistoryRequestParams):
       );
     } catch (err) {
       if (err instanceof TimelinePreferredReadError) {
-        return timelineHistoryErrorResult(err.source, err.reason);
+        const isRecoverable = TIMELINE_HISTORY_TRANSIENT_REASONS.has(err.reason) || isRecoverableTimelineRequestErrorReason(err.reason);
+        return timelineHistoryErrorResult(err.source, err.reason, isRecoverable ? { recoverable: true } : undefined);
+      }
+      if (err instanceof TimelineProjectionBusyError) {
+        return timelineHistoryErrorResult(TIMELINE_RESPONSE_SOURCES.MAIN_SQLITE, TIMELINE_HISTORY_ERROR_REASONS.PROJECTION_BUSY, { recoverable: true });
       }
       throw err;
     }
